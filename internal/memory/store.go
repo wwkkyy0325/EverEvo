@@ -876,7 +876,7 @@ func (s *Store) ListUserFacts(workspaceID string) ([]UserFact, error) {
 	if workspaceID == "" {
 		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts ORDER BY created_at DESC`)
 	} else {
-		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts WHERE workspace_id = ? OR workspace_id = 'default' ORDER BY created_at DESC`, workspaceID)
+		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts WHERE workspace_id = ? OR workspace_id = ? OR workspace_id = 'default' OR workspace_id IS NULL OR workspace_id = '' ORDER BY created_at DESC`, workspaceID, s.realDefaultLibrary())
 	}
 	if err != nil {
 		return nil, err
@@ -1844,7 +1844,7 @@ func (s *Store) ListMemoryItems(k int, workspaceID string) ([]MemoryItem, error)
 		// Include legacy 'default' rows so pre-isolation data is still visible
 		// in any library view (consistent with kg_nodes behavior).
 		rows, err = s.db.Query(`SELECT id, kind, content, reply, category, session_id, created_at, workspace_id
-			FROM memory_items WHERE workspace_id = ? OR workspace_id = 'default' ORDER BY created_at DESC LIMIT ?`, workspaceID, k)
+			FROM memory_items WHERE workspace_id = ? OR workspace_id = ? OR workspace_id = 'default' OR workspace_id IS NULL OR workspace_id = '' ORDER BY created_at DESC LIMIT ?`, workspaceID, s.realDefaultLibrary(), k)
 	} else {
 		rows, err = s.db.Query(`SELECT id, kind, content, reply, category, session_id, created_at, workspace_id
 			FROM memory_items ORDER BY created_at DESC LIMIT ?`, k)
@@ -2039,8 +2039,8 @@ type BBEntry struct {
 func (s *Store) CountMemory(workspaceID string) (turns int, facts int) {
 	if workspaceID != "" {
 		// Match ListMemoryItems: include legacy 'default' rows so counts agree.
-		_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='turn' AND (workspace_id = ? OR workspace_id = 'default')`, workspaceID).Scan(&turns)
-		_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='fact' AND (workspace_id = ? OR workspace_id = 'default')`, workspaceID).Scan(&facts)
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='turn' AND (workspace_id = ? OR workspace_id = ? OR workspace_id = 'default' OR workspace_id IS NULL OR workspace_id = '')`, workspaceID, s.realDefaultLibrary()).Scan(&turns)
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='fact' AND (workspace_id = ? OR workspace_id = ? OR workspace_id = 'default' OR workspace_id IS NULL OR workspace_id = '')`, workspaceID, s.realDefaultLibrary()).Scan(&facts)
 	} else {
 		_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='turn'`).Scan(&turns)
 		_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='fact'`).Scan(&facts)
@@ -2070,12 +2070,35 @@ func (s *Store) ListLowImportanceItems(k int) ([]MemoryItem, error) {
 }
 
 
-// MigrateDefaultWorkspace updates legacy 'default' workspace_id to the actual
-// library ID on all kg_nodes, kg_edges, and memory_items tables.
+// MigrateDefaultWorkspace updates legacy 'default' and NULL workspace_id values to
+// the actual library ID across all scoped tables. SQLite ADD COLUMN with DEFAULT
+// does NOT backfill existing rows — they stay NULL until explicitly updated.
 func (s *Store) MigrateDefaultWorkspace(libID string) {
-	s.db.Exec(`UPDATE kg_nodes SET workspace_id=? WHERE workspace_id='default'`, libID)
-	s.db.Exec(`UPDATE kg_edges SET workspace_id=? WHERE workspace_id='default'`, libID)
-	s.db.Exec(`UPDATE memory_items SET workspace_id=? WHERE workspace_id='default'`, libID)
+	tables := []string{"kg_nodes", "kg_edges", "memory_items", "user_facts", "experience_items"}
+	for _, table := range tables {
+		retryExec(s.db, `UPDATE `+table+` SET workspace_id=? WHERE workspace_id='default' OR workspace_id IS NULL OR workspace_id=''`, libID)
+	}
+}
+
+// retryExec runs an Exec with up to 3 retries on SQLITE_BUSY (lock contention).
+func retryExec(db *sql.DB, query string, args ...any) {
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err := db.Exec(query, args...)
+		if err == nil {
+			return
+		}
+		if isSQLiteBusy(err) && attempt < 2 {
+			time.Sleep(time.Duration(50*(1<<attempt)) * time.Millisecond)
+			continue
+		}
+		log.Printf("[memory] retryExec failed after %d attempts: %v (query: %s)", attempt+1, err, query[:min(80, len(query))])
+		return
+	}
+}
+
+func isSQLiteBusy(err error) bool {
+	return err != nil && (strings.Contains(err.Error(), "database is locked") ||
+		strings.Contains(err.Error(), "SQLITE_BUSY"))
 }
 // ─── Dream Candidates (P9) ──────────────────────────────────────
 

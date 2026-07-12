@@ -54,6 +54,8 @@ interface ToolDef {
   name: string
   description: string
   parameters: Record<string, unknown>
+  /** Raw MCP inputSchema — preferred over parameters when set (external tools). */
+  rawParameters?: Record<string, unknown>
   annotations?: { readOnlyHint?: boolean }
 }
 
@@ -328,7 +330,7 @@ export const useChatStore = defineStore('chat', () => {
 
     // Phase 3: Summarize via extraction provider.
     try {
-      const go = window.go.main.App
+      const go = window.go.app.App
       const resp = await go.ChatProxy(
         [{ role: 'system', content: '用中文总结以下对话的关键信息、决定和未解决问题。保留具体数字、文件名、技术决策。最多 300 字。' },
          { role: 'user', content: dialogue }],
@@ -381,8 +383,8 @@ export const useChatStore = defineStore('chat', () => {
 
   async function loadConfig() {
     try {
-      providers.value = await window.go.main.App.ListProviders() || []
-      const cfg = await window.go.main.App.GetConfig()
+      providers.value = await window.go.app.App.ListProviders() || []
+      const cfg = await window.go.app.App.GetConfig()
       if (cfg?.llm) {
         activeId.value = cfg.llm.activeProvider || ''
       }
@@ -391,7 +393,7 @@ export const useChatStore = defineStore('chat', () => {
 
   async function loadSkills() {
     try {
-      skills.value = await window.go.main.App.ListSkills('') || []
+      skills.value = await window.go.app.App.ListSkills('') || []
     } catch (_) { /* use defaults */ }
   }
 
@@ -744,7 +746,7 @@ export const useChatStore = defineStore('chat', () => {
   // ── Chat loop (internal) ──
 
   async function chatLoop() {
-    const go = window.go.main.App
+    const go = window.go.app.App
     const rt = window.runtime
 
     // Resolve chat inputs. A selected local Agent persona drives its own
@@ -786,10 +788,10 @@ export const useChatStore = defineStore('chat', () => {
       }
     } else {
       let enabledNames: string[]
-      try { enabledNames = await go.GetEnabledToolNames() } catch (_) { enabledNames = [] }
+      try { enabledNames = (await go.GetEnabledToolNames()) || [] } catch (_) { enabledNames = [] }
 
       let allTools: ToolDef[]
-      try { allTools = await go.ListTools() } catch (_) { allTools = [] }
+      try { allTools = (await go.ListTools()) || [] } catch (_) { allTools = [] }
 
       const isExternal = (n: string) => n.startsWith('mcp__')
       tools = allTools.filter(t => enabledNames.includes(t.name) || isExternal(t.name))
@@ -804,7 +806,7 @@ export const useChatStore = defineStore('chat', () => {
 
       // Build system prompt from enabled skills — domain-scoped.
       let enabledSkills: SkillInfo[]
-      try { enabledSkills = await go.ListEnabledSkills(activeLibraryId.value) } catch (_) { enabledSkills = [] }
+      try { enabledSkills = (await go.ListEnabledSkills(activeLibraryId.value)) || [] } catch (_) { enabledSkills = [] }
 
       const basePrompt = '你是 EverEvo 桌面软件的 AI 助手。用户说中文，用中文回复。当需要执行操作时使用工具调用。每次回复尽量简洁。\n\n用户可能通过拖拽或粘贴上传文件到对话中。对于文本文件（TXT、MD、CSV、JSON 等），内容会自动注入。对于 PDF 和图片文件，请使用 read_file 或 read_media_file 工具读取。对于扫描件 PDF（isScanned=true），请使用 read_media_file 工具以图片形式查看页面。'
       const skillPrompts = enabledSkills
@@ -963,7 +965,13 @@ export const useChatStore = defineStore('chat', () => {
           rt.EventsOn(errEvent, errHandler)
           const toolPayload = tools.map(t => ({
             type: 'function',
-            function: { name: t.name, description: t.description, parameters: t.parameters },
+            function: {
+              name: t.name,
+              description: t.description,
+              // Prefer raw MCP inputSchema to avoid schema fidelity loss;
+              // fall back to typed parameters for internal tools.
+              parameters: t.rawParameters || t.parameters,
+            },
           }))
           const effort = thinkMode.value ? thinkEffort.value : ''
           // Normalize before every send: guarantee every assistant.tool_calls

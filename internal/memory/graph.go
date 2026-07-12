@@ -196,8 +196,9 @@ func (s *Store) QueryGraph(seedIDs []string, hops int, libraryID string) ([]Grap
 	scopeClause := ""
 	var scopeArgs []any
 	if libraryID != "" {
-		scopeClause = ` AND (n.workspace_id = ? OR n.workspace_id = 'default')`
-		scopeArgs = []any{libraryID}
+		pool := s.defaultWorkspacePool()
+		scopeClause = ` AND (n.workspace_id = ? OR n.workspace_id IN (` + placeholders(len(pool)) + `))`
+		scopeArgs = append([]any{libraryID}, strsToAnys(pool)...)
 	}
 	q := `
 WITH RECURSIVE reach(id, depth) AS (
@@ -255,7 +256,10 @@ func (s *Store) ListNodesByLibrary(libraryID string) ([]GraphNode, error) {
 	if libraryID == "" {
 		rows, err = s.db.Query(`SELECT id, type, COALESCE(name_raw, name), created_at FROM kg_nodes ORDER BY created_at DESC`)
 	} else {
-		rows, err = s.db.Query(`SELECT id, type, COALESCE(name_raw, name), created_at FROM kg_nodes WHERE (workspace_id=? OR workspace_id='default') ORDER BY created_at DESC`, libraryID)
+		defID, _ := s.DefaultLibrary()
+		rows, err = s.db.Query(`SELECT id, type, COALESCE(name_raw, name), created_at FROM kg_nodes
+			WHERE (workspace_id=? OR workspace_id=? OR workspace_id='default' OR workspace_id='')
+			ORDER BY created_at DESC`, libraryID, defID)
 	}
 	if err != nil {
 		return nil, err
@@ -286,8 +290,9 @@ func (s *Store) ListAllEdgesByLibrary(libraryID string) ([]GraphEdge, error) {
 		JOIN kg_nodes dn ON dn.id = e.dst_id
 		WHERE e.valid_to IS NULL`
 	if libraryID != "" {
-		query += ` AND (sn.workspace_id IN (?,'default') OR dn.workspace_id IN (?,'default') OR e.cross_tags LIKE ?)`
-		rows, err = s.db.Query(query+" ORDER BY e.recorded_at DESC", libraryID, libraryID, "%"+libraryID+"%")
+		defID, _ := s.DefaultLibrary()
+		query += ` AND (sn.workspace_id IN (?,?,'default','') OR dn.workspace_id IN (?,?,'default','') OR e.cross_tags LIKE ?)`
+		rows, err = s.db.Query(query+" ORDER BY e.recorded_at DESC", libraryID, defID, libraryID, defID, "%"+libraryID+"%")
 	} else {
 		rows, err = s.db.Query(query + " ORDER BY e.recorded_at DESC")
 	}
@@ -319,8 +324,9 @@ func (s *Store) ListAllEdgesIncludeHistoryByLibrary(libraryID string) ([]GraphEd
 	var rows *sql.Rows
 	var err error
 	if libraryID != "" {
-		query += ` WHERE (sn.workspace_id IN (?,'default') OR dn.workspace_id IN (?,'default') OR e.cross_tags LIKE ?)`
-		rows, err = s.db.Query(query+" ORDER BY e.recorded_at DESC", libraryID, libraryID, "%"+libraryID+"%")
+		defID, _ := s.DefaultLibrary()
+		query += ` WHERE (sn.workspace_id IN (?,?,'default','') OR dn.workspace_id IN (?,?,'default','') OR e.cross_tags LIKE ?)`
+		rows, err = s.db.Query(query+" ORDER BY e.recorded_at DESC", libraryID, defID, libraryID, defID, "%"+libraryID+"%")
 	} else {
 		rows, err = s.db.Query(query + " ORDER BY e.recorded_at DESC")
 	}
@@ -376,7 +382,8 @@ func (s *Store) NodeCountByLibrary(libraryID string) int {
 	if libraryID == "" {
 		_ = s.db.QueryRow(`SELECT COUNT(*) FROM kg_nodes`).Scan(&n)
 	} else {
-		_ = s.db.QueryRow(`SELECT COUNT(*) FROM kg_nodes WHERE (workspace_id=? OR workspace_id='default')`, libraryID).Scan(&n)
+		defID, _ := s.DefaultLibrary()
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM kg_nodes WHERE (workspace_id=? OR workspace_id=? OR workspace_id='default' OR workspace_id='')`, libraryID, defID).Scan(&n)
 	}
 	return n
 }
@@ -562,8 +569,217 @@ func (s *Store) ListEdgesForNode(nodeID string, limit int) ([]GraphEdge, error) 
 	return out, rows.Err()
 }
 
+// FindNodeByName returns the full node row (id, workspace_id) for a normalized
+// name, or ("", "") if not found. Used for domain inference when creating edges.
+func (s *Store) FindNodeByName(name string) (id, workspaceID string) {
+	norm := normalizeName(name)
+	if norm == "" {
+		return "", ""
+	}
+	_ = s.db.QueryRow(`SELECT id, workspace_id FROM kg_nodes WHERE name = ? LIMIT 1`, norm).Scan(&id, &workspaceID)
+	return
+}
+
+// defaultWorkspacePool returns the set of workspace_id values that are considered
+// "unassigned": the literal 'default', empty string, and the actual default library
+// UUID. All queries that scope or propagate domain assignment MUST use this pool
+// instead of hardcoding 'default'.
+func (s *Store) defaultWorkspacePool() []string {
+	defID, _ := s.DefaultLibrary()
+	pool := []string{"default", ""}
+	if defID != "" && defID != "default" {
+		pool = append(pool, defID)
+	}
+	return pool
+}
+
+// IsDefaultWS returns true if the given workspace_id is in the default pool.
+func (s *Store) IsDefaultWS(ws string) bool {
+	if ws == "" || ws == "default" {
+		return true
+	}
+	defID, _ := s.DefaultLibrary()
+	return ws == defID
+}
+
+// SetNodeWorkspace updates the workspace_id on an existing node. Best-effort —
+// silently no-ops if the node doesn't exist or is already in a different domain.
+func (s *Store) SetNodeWorkspace(nodeID, workspaceID string) {
+	defID, _ := s.DefaultLibrary()
+	// Match both the literal 'default' and the actual default library UUID.
+	_, _ = s.db.Exec(`UPDATE kg_nodes SET workspace_id = ?
+		WHERE id = ? AND (workspace_id = 'default' OR workspace_id = ? OR workspace_id = '')`,
+		workspaceID, nodeID, defID)
+}
+
 // RenameEdge updates the relation type (predicate) of an edge.
 func (s *Store) RenameEdge(id, newType string) error {
 	_, err := s.db.Exec(`UPDATE kg_edges SET type = ? WHERE id = ?`, newType, id)
 	return err
+}
+
+// PropagateGraphWorkspace starts from seed nodes (name→libraryID) and propagates
+// domain assignment along edges: if node A belongs to domain X and A→B has an edge,
+// and B is still in the default pool, then B is reassigned to X. Runs multiple
+// rounds until no more nodes are reassigned (fixed-point iteration).
+//
+// Returns the number of nodes reassigned.
+func (s *Store) PropagateGraphWorkspace(seedHints map[string]string) (int, error) {
+	if len(seedHints) == 0 {
+		return 0, nil
+	}
+
+	// Compute the default-pool set: 'default' string + actual default library UUID.
+	defID, _ := s.DefaultLibrary()
+	defPool := []string{"default", ""}
+	if defID != "" && defID != "default" {
+		defPool = append(defPool, defID)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// ── Round 0: apply seed hints to matching nodes ──
+	total := 0
+	for normName, libID := range seedHints {
+		res, err := tx.Exec(`UPDATE kg_nodes SET workspace_id = ?
+			WHERE (name = ? OR name_raw = ?) AND workspace_id IN (`+
+			placeholders(len(defPool))+`)`,
+			append([]any{libID, normName, normName}, strsToAnys(defPool)...)...)
+		if err != nil {
+			return 0, err
+		}
+		n, _ := res.RowsAffected()
+		total += int(n)
+	}
+
+	// ── Rounds 1..N: propagate along edges until convergence ──
+	defPlaceholders := placeholders(len(defPool))
+	for round := 1; round <= 5; round++ {
+		// src has domain, dst is in default pool → propagate src domain to dst.
+		query1 := `UPDATE kg_nodes SET workspace_id = (
+			SELECT DISTINCT sn.workspace_id FROM kg_edges e
+			JOIN kg_nodes sn ON sn.id = e.src_id
+			WHERE e.dst_id = kg_nodes.id
+			  AND sn.workspace_id NOT IN (` + defPlaceholders + `)
+			LIMIT 1
+		) WHERE kg_nodes.id IN (
+			SELECT e.dst_id FROM kg_edges e
+			JOIN kg_nodes sn ON sn.id = e.src_id
+			WHERE sn.workspace_id NOT IN (` + defPlaceholders + `)
+			  AND EXISTS (SELECT 1 FROM kg_nodes dn WHERE dn.id = e.dst_id AND dn.workspace_id IN (` + defPlaceholders + `))
+		)`
+		args1 := append([]any{}, strsToAnys(defPool)...)
+		args1 = append(args1, strsToAnys(defPool)...)
+		args1 = append(args1, strsToAnys(defPool)...)
+		res, err := tx.Exec(query1, args1...)
+		if err != nil {
+			return 0, err
+		}
+		n1, _ := res.RowsAffected()
+
+		// Same in reverse: dst has domain, propagate to src.
+		query2 := `UPDATE kg_nodes SET workspace_id = (
+			SELECT DISTINCT dn.workspace_id FROM kg_edges e
+			JOIN kg_nodes dn ON dn.id = e.dst_id
+			WHERE e.src_id = kg_nodes.id
+			  AND dn.workspace_id NOT IN (` + defPlaceholders + `)
+			LIMIT 1
+		) WHERE kg_nodes.id IN (
+			SELECT e.src_id FROM kg_edges e
+			JOIN kg_nodes dn ON dn.id = e.dst_id
+			WHERE dn.workspace_id NOT IN (` + defPlaceholders + `)
+			  AND EXISTS (SELECT 1 FROM kg_nodes sn WHERE sn.id = e.src_id AND sn.workspace_id IN (` + defPlaceholders + `))
+		)`
+		args2 := append([]any{}, strsToAnys(defPool)...)
+		args2 = append(args2, strsToAnys(defPool)...)
+		args2 = append(args2, strsToAnys(defPool)...)
+		res2, err := tx.Exec(query2, args2...)
+		if err != nil {
+			return 0, err
+		}
+		n2, _ := res2.RowsAffected()
+
+		roundN := int(n1) + int(n2)
+		total += roundN
+		if roundN == 0 {
+			break // converged
+		}
+	}
+
+	err = tx.Commit()
+	tx = nil
+	return total, err
+}
+
+// strsToAnys converts []string to []any for SQL argument lists.
+func strsToAnys(in []string) []any {
+	out := make([]any, len(in))
+	for i, s := range in {
+		out[i] = s
+	}
+	return out
+}
+
+// MigrateGraphNodes reassigns workspace_id on graph nodes whose name (or
+// normalized name) appears in the hint set for a given library. Only reassigns
+// nodes currently on 'default' (never steals from another explicit domain).
+// Deprecated: prefer PropagateGraphWorkspace which also propagates along edges.
+func (s *Store) MigrateGraphNodes(nameHints map[string]string) (int, error) {
+	if len(nameHints) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for normName, libID := range nameHints {
+		res, err := tx.Exec(`UPDATE kg_nodes SET workspace_id = ?
+			WHERE (name = ? OR name_raw = ?) AND (workspace_id = 'default')`,
+			libID, normName, normName)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		n, _ := res.RowsAffected()
+		total += int(n)
+	}
+	return total, tx.Commit()
+}
+
+// NodeWorkspace returns the workspace_id of a single graph node, or "" if not found.
+func (s *Store) NodeWorkspace(nodeID string) string {
+	var ws string
+	if err := s.db.QueryRow(`SELECT workspace_id FROM kg_nodes WHERE id = ?`, nodeID).Scan(&ws); err != nil {
+		return ""
+	}
+	return ws
+}
+
+// ListNodeWorkspaces returns the distinct (workspace_id, count) pairs for graph
+// nodes, for UI domain assignment inspection.
+func (s *Store) ListNodeWorkspaces() (map[string]int, error) {
+	rows, err := s.db.Query(`SELECT workspace_id, COUNT(*) FROM kg_nodes GROUP BY workspace_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var ws string
+		var c int
+		if err := rows.Scan(&ws, &c); err != nil {
+			return nil, err
+		}
+		out[ws] = c
+	}
+	return out, rows.Err()
 }

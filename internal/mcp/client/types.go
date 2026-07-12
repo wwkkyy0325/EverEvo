@@ -98,7 +98,7 @@ type mcpToolDef struct {
 	Name        string          `json:"name"`
 	Title       string          `json:"title,omitempty"`
 	Description string          `json:"description"`
-	InputSchema mcpInputSchema  `json:"inputSchema"`
+	InputSchema json.RawMessage `json:"inputSchema"`
 }
 
 type mcpInputSchema struct {

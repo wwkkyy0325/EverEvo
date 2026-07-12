@@ -2,8 +2,8 @@
  * Wails API call wrapper — timeout, abort, unified error handling.
  *
  * Usage:
- *   const models = await call(() => window.go.main.App.ListModels())
- *   const { data, cancel } = callWithCancel(() => window.go.main.App.ProbeModelCap(...))
+ *   const models = await call(() => window.go.app.App.ListModels())
+ *   const { data, cancel } = callWithCancel(() => window.go.app.App.ProbeModelCap(...))
  */
 
 export interface CallOptions {

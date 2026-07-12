@@ -46,14 +46,14 @@ export const useDownloadStore = defineStore('download', () => {
 
   async function fetchAll() {
     try {
-      activeTasks.value = await window.go.main.App.GetDownloadTasks() || []
-      historyTasks.value = await window.go.main.App.GetDownloadHistory() || []
+      activeTasks.value = await window.go.app.App.GetDownloadTasks() || []
+      historyTasks.value = await window.go.app.App.GetDownloadHistory() || []
     } catch (_) {}
   }
 
   async function refreshHistory() {
     try {
-      const history = await window.go.main.App.GetDownloadHistory() || []
+      const history = await window.go.app.App.GetDownloadHistory() || []
       // Filter out items that are currently being cancelled to avoid
       // the polling timer racing with cancelDownload's optimistic removal.
       historyTasks.value = _cancelling.size > 0
@@ -147,14 +147,14 @@ export const useDownloadStore = defineStore('download', () => {
   }
 
   async function pauseDownload(id: string) {
-    try { await window.go.main.App.PauseDownload(id) } catch (_) {}
+    try { await window.go.app.App.PauseDownload(id) } catch (_) {}
   }
   async function resumeDownload(id: string) {
-    try { await window.go.main.App.ResumeDownload(id) } catch (_) {}
+    try { await window.go.app.App.ResumeDownload(id) } catch (_) {}
   }
   async function retryDownload(id: string) {
     try {
-      await window.go.main.App.RetryDownload(id)
+      await window.go.app.App.RetryDownload(id)
       historyTasks.value = historyTasks.value.filter(t => t.id !== id)
       await fetchAll()
     } catch (_) {}
@@ -166,24 +166,24 @@ export const useDownloadStore = defineStore('download', () => {
     _cancelling.add(id)
 
     try {
-      await window.go.main.App.CancelDownload(id)
+      await window.go.app.App.CancelDownload(id)
     } catch (e) {
       console.error('[download] cancel failed:', id, e)
       // Backend call failed — re-fetch to restore correct state.
       await refreshHistory()
       try {
-        activeTasks.value = await window.go.main.App.GetDownloadTasks() || []
+        activeTasks.value = await window.go.app.App.GetDownloadTasks() || []
       } catch (_) {}
     } finally {
       _cancelling.delete(id)
     }
   }
   async function clearHistory() {
-    try { await window.go.main.App.ClearDownloadHistory() } catch (_) {}
+    try { await window.go.app.App.ClearDownloadHistory() } catch (_) {}
     historyTasks.value = []
   }
-  function openDownloadDir() { window.go.main.App.OpenDownloadDir().catch(() => {}) }
-  function openDownloadedFileDir(filename: string) { window.go.main.App.OpenDownloadedFileDir(filename).catch(() => {}) }
+  function openDownloadDir() { window.go.app.App.OpenDownloadDir().catch(() => {}) }
+  function openDownloadedFileDir(filename: string) { window.go.app.App.OpenDownloadedFileDir(filename).catch(() => {}) }
 
   function setFileDownloading(file: string) {
     fileProgress.value = {

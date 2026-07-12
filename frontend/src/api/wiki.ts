@@ -3,7 +3,7 @@
  */
 import { call } from './client'
 
-const App = () => window.go.main.App
+const App = () => window.go.app.App
 
 export interface WikiChunk { page: string; heading: string; content: string }
 

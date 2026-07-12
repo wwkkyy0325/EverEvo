@@ -1,4 +1,4 @@
-﻿package client
+package client
 
 import (
 	"context"
@@ -26,10 +26,7 @@ type Manager struct {
 
 // NewManager creates a new MCP client manager and loads persisted config.
 func NewManager() *Manager {
-	dataDir, err := storage.DataDir()
-	if err != nil {
-		dataDir = "data"
-	}
+	dataDir := storage.DataDir()
 	path := filepath.Join(dataDir, "mcp_servers.json")
 	return &Manager{
 		connections: make(map[string]*Connection),
@@ -120,7 +117,14 @@ func (m *Manager) AddServer(cfg ServerConfig) error {
 	defer m.mu.Unlock()
 
 	if cfg.ID == "" {
-		maxN := 0; for id := range m.connections { var n int; if _, err := fmt.Sscanf(id, "srv_%d", &n); err == nil && n > maxN { maxN = n } }; cfg.ID = fmt.Sprintf("srv_%d", maxN+1)
+		maxN := 0
+		for id := range m.connections {
+			var n int
+			if _, err := fmt.Sscanf(id, "srv_%d", &n); err == nil && n > maxN {
+				maxN = n
+			}
+		}
+		cfg.ID = fmt.Sprintf("srv_%d", maxN+1)
 	}
 	if _, exists := m.connections[cfg.ID]; exists {
 		return fmt.Errorf("server %q already exists", cfg.ID)
@@ -353,14 +357,14 @@ func (m *Manager) doConnect(conn *Connection, id string, cfg ServerConfig) error
 			break
 		}
 		if cfg.Command == "npx" || cfg.Command == "npm" {
-				if pkg := extractNPMPackage(cfg.Args); pkg != "" {
-					if ee := ensureNpmPackage(pkg); ee != nil {
-						log.Printf("[mcp] npm dependency check/install failed for %s: %v", pkg, ee)
-						// non-fatal: npx may still resolve the package at runtime
-					}
+			if pkg := extractNPMPackage(cfg.Args); pkg != "" {
+				if ee := ensureNpmPackage(pkg); ee != nil {
+					log.Printf("[mcp] npm dependency check/install failed for %s: %v", pkg, ee)
+					// non-fatal: npx may still resolve the package at runtime
 				}
 			}
-			t, err = newStdioTransport(cfg.Command, cfg.Args, cfg.Env)
+		}
+		t, err = newStdioTransport(cfg.Command, cfg.Args, cfg.Env)
 	case "http":
 		if cfg.URL == "" {
 			err = fmt.Errorf("http transport requires a URL")
@@ -605,8 +609,6 @@ func GetRecommends() []RecommendInfo {
 			Args:     []string{"-y", "@anthropic/mcp-server-brave-search"},
 			Category: "data",
 		},
-		{
-		},
 	}
 }
 
@@ -655,18 +657,36 @@ func mcpToInternalTool(mt mcpToolDef, serverID, serverName string) *tools.ToolDe
 	// Build namespaced name: mcp__<server_id>__<tool_name>
 	fullName := "mcp__" + serverID + "__" + mt.Name
 
+	// Parse the raw inputSchema for typed property extraction.
+	// We preserve the raw JSON separately so complex schema constructs
+	// (anyOf, oneOf, $ref, etc.) survive the round-trip to the LLM API.
+	var schema mcpInputSchema
+	if len(mt.InputSchema) > 0 {
+		if err := json.Unmarshal(mt.InputSchema, &schema); err != nil {
+			// Best-effort: fall back to empty schema on parse failure
+			schema = mcpInputSchema{}
+		}
+	}
+
 	props := make(map[string]tools.ToolProp)
 	var required []string
-	if mt.InputSchema.Properties != nil {
-		for k, v := range mt.InputSchema.Properties {
+	if schema.Properties != nil {
+		for k, v := range schema.Properties {
+			propType := v.Type
+			// Defensive: some MCP servers emit empty type fields, which
+			// DeepSeek/OpenAI reject as invalid JSON Schema. Default to
+			// "string" so the tool is still usable.
+			if propType == "" {
+				propType = "string"
+			}
 			props[k] = tools.ToolProp{
-				Type:        v.Type,
+				Type:        propType,
 				Description: v.Description,
 				Enum:        v.Enum,
 				Default:     v.Default,
 			}
 		}
-		required = mt.InputSchema.Required
+		required = schema.Required
 	}
 
 	title := mt.Title
@@ -684,5 +704,6 @@ func mcpToInternalTool(mt mcpToolDef, serverID, serverName string) *tools.ToolDe
 			Properties: props,
 			Required:   required,
 		},
+		RawParameters: mt.InputSchema,
 	}
 }

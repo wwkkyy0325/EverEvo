@@ -26,7 +26,7 @@ type MarketCache struct {
 }
 
 func cachePath() string {
-	dir, _ := storage.DataDir()
+	dir := storage.DataDir()
 	return filepath.Join(dir, "marketplace_cache.json")
 }
 

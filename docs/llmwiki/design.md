@@ -147,15 +147,14 @@ type ModelRunner interface {
 
 ## Build
 
-- `build.ps1 all`（Windows）：前端 → Go → `Bundle-Runtime`（拷 `onnxruntime.dll` 到 EXE 旁）。
-- `build.ps1 dev`：热重载。
-- `make all` / `make dev`（Linux/macOS；ONNX/llama 路径 Windows-only）。
+- `scripts/build.ps1 all`（Windows）：前端 → Go → `Bundle-Runtime`（拷 `onnxruntime.dll` 到 EXE 旁）。
+- `scripts/build.ps1 dev`：热重载。
 - ONNX Runtime 1.26 DLL bundled 在 `third_party/onnxruntime/win-x64/`；`backends.findDLL` 优先 EXE 目录，故 bundled DLL 胜过系统 DLL。
 
 ## Key Decisions
 
 - **产品方向（2026-06 重定义）**：从「通用模型运行器」转向「模型工具箱」——市场（下载浏览）+ 工具箱（每类模型专用工具）。通用文本运行框将被淘汰。
-- **ONNX via `yalue/onnxruntime_go`（首个也是唯一 CGo）**：`internal/backends/onnx/` 通过 yalue（v1.31.0，`ORT_API_VERSION 26`）调用 onnxruntime。旧的手写 syscall 绑定已删除（ABI bug → 闪退）。ORT C API forward-locked，故 bundled ONNX Runtime **1.26** DLL（`third_party/`，`build.ps1 Bundle-Runtime`）。
+- **ONNX via `yalue/onnxruntime_go`（首个也是唯一 CGo）**：`internal/backends/onnx/` 通过 yalue（v1.31.0，`ORT_API_VERSION 26`）调用 onnxruntime。旧的手写 syscall 绑定已删除（ABI bug → 闪退）。ORT C API forward-locked，故 bundled ONNX Runtime **1.26** DLL（`third_party/`，`scripts/build.ps1 Bundle-Runtime`）。
 - **Tokenizer via `sugarme/tokenizer`（纯 Go）**：`internal/tokenizer/` 用 sugarme 加载模型自带 `tokenizer.json`，复现 HF BERT WordPiece 流水线。
 - **llama.cpp 暂为 stub**：Windows 下三个 Go 绑定均不可用——`develerltd`（编译失败，`purego.Dlopen` Unix-only）、`dianlight` v0.1.0（`Decode` 仅 Darwin）、`tcpipuk`（go-get 包缺 `libbinding.a`/C++ 源，需 clone+make）。当前 stub 明确报错不崩。后续若采用 `tcpipuk`（需预编译 `libbinding.a`）可替换。
 - **Rust 引擎 / CGo bridge 未实现**：历史设计规划 `internal/bridge` + `engine/`，截至当前未实现；项目纯 Go + 一个 CGo（yalue）。

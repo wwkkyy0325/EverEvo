@@ -74,12 +74,12 @@ func defaultEverEvoSource() Source {
 // ─── Sources ──────────────────────────────────────────────────────
 
 func (m *Manager) sourcesPath() string {
-	dir, _ := storage.DataDir()
+	dir := storage.DataDir()
 	return filepath.Join(dir, "guides", "sources.json")
 }
 
 func guidesDir() string {
-	dir, _ := storage.DataDir()
+	dir := storage.DataDir()
 	return filepath.Join(dir, "guides")
 }
 
@@ -237,18 +237,29 @@ func (m *Manager) ReadGuide(id string) (string, error) {
 	return string(data), nil
 }
 
-// SearchGuides searches guide titles and filenames for a keyword.
+// SearchGuides searches guide titles, filenames, and content for a keyword.
+// Chinese text is matched character-by-character (substring) — no word segmentation
+// needed since strings.Contains handles CJK natively.
 func (m *Manager) SearchGuides(query string) []Guide {
 	all := m.ListGuides()
 	if query == "" {
 		return all
 	}
-	q := strings.ToLower(query)
+	q := strings.ToLower(strings.TrimSpace(query))
 	var results []Guide
 	for _, g := range all {
+		// Title and path match (fast).
 		if strings.Contains(strings.ToLower(g.Title), q) ||
 			strings.Contains(strings.ToLower(g.Path), q) {
 			results = append(results, g)
+			continue
+		}
+		// Content match — reconstruct full path from source dir + relative path.
+		fullPath := filepath.Join(m.sourceDir(g.Source), filepath.FromSlash(g.Path))
+		if data, err := os.ReadFile(fullPath); err == nil {
+			if strings.Contains(strings.ToLower(string(data)), q) {
+				results = append(results, g)
+			}
 		}
 	}
 	return results

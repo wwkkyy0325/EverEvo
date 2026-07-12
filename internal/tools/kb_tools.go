@@ -18,10 +18,25 @@ func registerKBTools() {
 		Parameters: &ToolParams{
 			Type: "object",
 			Properties: map[string]ToolProp{
-				"name":     {Type: "string", Description: "知识库名称"},
-				"modelDir": {Type: "string", Description: "嵌入模型的本地目录路径（需包含 ONNX 模型文件）"},
+				"name":      {Type: "string", Description: "知识库名称"},
+				"modelDir":  {Type: "string", Description: "嵌入模型的本地目录路径（需包含 ONNX 模型文件）"},
+				"libraryId": {Type: "string", Description: "目标领域库 ID（来自 library_list）。不传则使用默认领域"},
 			},
 			Required: []string{"name", "modelDir"},
+		},
+	})
+
+	Register(&ToolDef{
+		Name:        "kb_set_library",
+		Description: "将知识库移动到指定领域库。用于修正知识库归属领域，或在领域间迁移知识库",
+		Category:    "kb",
+		Parameters: &ToolParams{
+			Type: "object",
+			Properties: map[string]ToolProp{
+				"kbId":      {Type: "string", Description: "知识库 ID"},
+				"libraryId": {Type: "string", Description: "目标领域库 ID（来自 library_list）。传空字符串则移回默认领域"},
+			},
+			Required: []string{"kbId", "libraryId"},
 		},
 	})
 

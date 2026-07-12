@@ -8,178 +8,276 @@ import (
 	"strings"
 )
 
-// KnownModelExtensions 已知模型文件扩展名。
+// KnownModelExtensions lists known model file extensions.
 var KnownModelExtensions = []string{".gguf", ".onnx", ".safetensors", ".bin", ".pt", ".pth"}
 
-// ─── Path resolution — everything under %APPDATA%/EverEvo/ ──────
+// ─── Path resolution — portable or AppData ───────────────────────
 //
-// Layout:
+// Project root: the directory containing go.mod, found by walking up
+// from the EXE. This works for EXEs anywhere in the tree:
+//   - root/everevo.exe         → root
+//   - root/build/bin/everevo.exe → root (walk up 2 levels)
+//   - root/sandbox/alpha/everevo.exe → root (walk up 2 levels)
+//
+// Portable mode (go.mod found):
+//
+//	{projectRoot}/
+//	├── data/           ← protected: zones, memory.db, chromem, wiki, knowledge
+//	├── runtime/        ← rebuildable: models, plugins, downloads, guides
+//	├── build/bin/      ← wails build output
+//	└── sandbox/        ← evolution sandbox instances
+//
+// User mode (no go.mod found = standalone EXE):
 //
 //	%APPDATA%/EverEvo/
-//	├── config.json               global config
-//	├── models/                   downloaded models (large, redownloadable)
-//	├── cache/                    download cache
-//	├── plugins/                  plugin subdirectories
-//	├── plugin-tmp/               plugin scratch space
-//	├── guides/                   synced guide content
-//	├── zones/
-//	│   └── {zone}/               per-zone isolation
-//	│       ├── agents.json
-//	│       ├── skills.json
-//	│       ├── mcp_servers.json
-//	│       ├── a2a_agents.json
-//	│       ├── config.json
-//	│       ├── memory/           memory.db + chromem
-//	│       ├── knowledge/        RAG chromem + meta
-//	│       ├── wiki/             wiki chromem + pages
-//	│       └── workflows/        workflow JSON files
-//
-// This layout keeps ALL mutable data under the user's profile, separate
-// from the EXE. Self-evolution recompilation never touches user data.
+//	├── data/
+//	└── runtime/
 
-// rootAppData computes the root %APPDATA%\EverEvo prefix.
-func rootAppData() (string, error) {
-	dir := os.Getenv("APPDATA")
-	if dir == "" {
-		dir = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Roaming")
+// ExeDir returns the directory containing the running executable.
+func ExeDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		wd, _ := os.Getwd()
+		return wd
 	}
-	if dir == "" {
-		return "", fmt.Errorf("无法确定 APPDATA 目录")
-	}
-	return filepath.Join(dir, "EverEvo"), nil
+	return filepath.Dir(exe)
 }
 
-// RootAppDataDir returns the user-scoped application data root — survives EXE reinstalls.
-func RootAppDataDir() (string, error) {
-	return rootAppData()
+// ProjectRoot walks up from the EXE directory until it finds go.mod.
+// Falls back to the working directory (wails dev compiles EXE to temp dir).
+// Returns "" if not found anywhere (standalone EXE, not in a dev tree).
+func ProjectRoot() string {
+	if root := walkUpToGoMod(ExeDir()); root != "" {
+		return root
+	}
+	// wails dev: EXE is compiled to a temp dir, but CWD is the project root.
+	if wd, err := os.Getwd(); err == nil {
+		return walkUpToGoMod(wd)
+	}
+	return ""
+}
+
+func walkUpToGoMod(start string) string {
+	dir := start
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+// IsPortable returns true when the EXE lives inside a source tree
+// (go.mod found anywhere up the directory chain).
+func IsPortable() bool {
+	return ProjectRoot() != ""
+}
+
+// DataDir returns the root of protected (non-rebuildable) data.
+// This is the directory that holds zones/, memory.db, wiki/, knowledge/, etc.
+//
+//	Portable:  {projectRoot}/data
+//	User mode: %APPDATA%/EverEvo  (no extra /data — AppData IS the data dir)
+func DataDir() string {
+	if root := ProjectRoot(); root != "" {
+		return filepath.Join(root, "data")
+	}
+	return appDataRoot()
+}
+
+// RuntimeDir returns the root of rebuildable runtime data.
+//
+//	Portable:  {projectRoot}/runtime
+//	User mode: %APPDATA%/EverEvo/runtime
+func RuntimeDir() string {
+	if root := ProjectRoot(); root != "" {
+		return filepath.Join(root, "runtime")
+	}
+	return filepath.Join(appDataRoot(), "runtime")
 }
 
 // AppDataDir returns the zone-scoped data directory.
 //
-//	EVEREVO_ZONE=""       → %APPDATA%\EverEvo\zones\production
-//	EVEREVO_ZONE=exper-1  → %APPDATA%\EverEvo\zones\exper-1
+//	EVEREVO_ZONE=""       → data/zones/production
+//	EVEREVO_ZONE=alpha    → data/zones/alpha
 func AppDataDir() (string, error) {
-	base, err := rootAppData()
-	if err != nil {
-		return "", err
-	}
 	zone := os.Getenv("EVEREVO_ZONE")
 	if zone == "" {
 		zone = "production"
 	}
-	return filepath.Join(base, "zones", zone), nil
+	return filepath.Join(DataDir(), "zones", zone), nil
 }
 
-// ExeDir returns the directory containing the running executable.
-func ExeDir() (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Dir(exe), nil
+// RootAppDataDir returns the shared data root (for multi-zone access).
+func RootAppDataDir() (string, error) {
+	return DataDir(), nil
 }
 
-// DataDir returns the shared data root — %APPDATA%\EverEvo.
-// All mutable data lives here, completely separate from the EXE directory.
-func DataDir() (string, error) {
-	return rootAppData()
-}
+// ─── Sub-directory helpers ────────────────────────────────────────
 
-// ModelsDir returns the shared model storage directory.
-// Priority order for finding existing models (for backward compat):
-//  1. %APPDATA%/EverEvo/models (new canonical location)
-//  2. {EXE}/data/models (legacy, migrated automatically)
-//  3. {CWD}/data/models (wails dev mode)
-func ModelsDir() (string, error) {
-	base, err := rootAppData()
-	if err == nil {
-		p := filepath.Join(base, "models")
-		if st, e := os.Stat(p); e == nil && st.IsDir() {
-			return p, nil
+// ModelsDir returns the model storage directory.
+func ModelsDir() string {
+	dir := filepath.Join(RuntimeDir(), "models")
+	// Check legacy locations for existing models.
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		for _, legacy := range []string{
+			filepath.Join(appDataRoot(), "models"),
+			filepath.Join(ExeDir(), "data", "models"),
+		} {
+			if st, e := os.Stat(legacy); e == nil && st.IsDir() {
+				return legacy
+			}
 		}
 	}
-
-	// Legacy paths — find models so the migration can move them.
-	candidates := []string{}
-	if wd, err := os.Getwd(); err == nil {
-		candidates = append(candidates, filepath.Join(wd, "data", "models"))
-	}
-	if exe, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exe)
-		candidates = append(candidates, filepath.Join(exeDir, "data", "models"))
-		candidates = append(candidates, filepath.Join(filepath.Dir(exeDir), "data", "models"))
-	}
-	for _, d := range candidates {
-		if st, e := os.Stat(d); e == nil && st.IsDir() {
-			return d, nil
-		}
-	}
-
-	// Fallback: canonical APPDATA path (will be created if missing).
-	if base != "" {
-		return filepath.Join(base, "models"), nil
-	}
-	return "", fmt.Errorf("无法确定模型目录")
+	return dir
 }
 
-// CacheDir returns the shared cache directory under APPDATA.
-func CacheDir() (string, error) {
-	base, err := DataDir()
-	if err != nil {
-		return "", err
+// PluginsDir returns the plugin installation directory.
+func PluginsDir() string { return filepath.Join(RuntimeDir(), "plugins") }
+
+// DownloadsDir returns the download cache directory.
+func DownloadsDir() string { return filepath.Join(RuntimeDir(), "downloads") }
+
+// GuidesDir returns the synced guides directory.
+func GuidesDir() string { return filepath.Join(RuntimeDir(), "guides") }
+
+// CacheDir returns the general cache directory.
+func CacheDir() string { return filepath.Join(RuntimeDir(), "cache") }
+
+// ─── Legacy AppData helpers (for migration) ───────────────────────
+
+// appDataRoot returns the old %APPDATA%/EverEvo path.
+func appDataRoot() string {
+	dir := os.Getenv("APPDATA")
+	if dir == "" {
+		dir = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Roaming")
 	}
-	return filepath.Join(base, "cache"), nil
+	return filepath.Join(dir, "EverEvo")
+}
+
+// OldAppDataDir returns the legacy zone-scoped AppData path (for migration).
+func OldAppDataDir() string {
+	zone := os.Getenv("EVEREVO_ZONE")
+	if zone == "" {
+		zone = "production"
+	}
+	return filepath.Join(appDataRoot(), "zones", zone)
+}
+
+// ─── Directory initialization ─────────────────────────────────────
+
+// EnsureDirs creates all required data and runtime directories.
+func EnsureDirs() error {
+	zone := os.Getenv("EVEREVO_ZONE")
+	if zone == "" {
+		zone = "production"
+	}
+	zoneDir := filepath.Join(DataDir(), "zones", zone)
+
+	dirs := []string{
+		// Protected data
+		zoneDir,
+		filepath.Join(zoneDir, "memory"),
+		filepath.Join(zoneDir, "knowledge"),
+		filepath.Join(zoneDir, "knowledge", "chromem"),
+		filepath.Join(zoneDir, "wiki"),
+		filepath.Join(zoneDir, "wiki", "chromem"),
+		filepath.Join(zoneDir, "workflows"),
+		filepath.Join(zoneDir, "skills"),
+		// Rebuildable runtime
+		ModelsDir(),
+		PluginsDir(),
+		DownloadsDir(),
+		GuidesDir(),
+		CacheDir(),
+	}
+	for _, p := range dirs {
+		if err := os.MkdirAll(p, 0755); err != nil {
+			return fmt.Errorf("create %s: %w", p, err)
+		}
+	}
+	return nil
 }
 
 // ─── Migration ─────────────────────────────────────────────────────
 
-// oldExeDataDir returns the legacy data/ directory beside the EXE (may not exist).
-func oldExeDataDir() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return ""
+// MigrateLegacyData moves data from the old %APPDATA%/EverEvo/ tree into
+// the new portable layout. Safe to call at every startup — existing data
+// in the new location is never overwritten.
+//
+// Migration is only relevant in portable mode. In user mode the AppData
+// paths are already correct.
+func MigrateLegacyData() {
+	if !IsPortable() {
+		return // user mode — AppData paths unchanged
 	}
-	return filepath.Join(filepath.Dir(exe), "data")
+
+	oldRoot := appDataRoot()
+	if _, err := os.Stat(oldRoot); os.IsNotExist(err) {
+		return // nothing to migrate
+	}
+
+	newData := DataDir()
+	newRuntime := RuntimeDir()
+	oldZoneDir := filepath.Join(oldRoot, "zones", "production")
+	newZoneDir := filepath.Join(newData, "zones", "production")
+
+	log.Printf("[migrate] 检测到旧数据目录 %s，迁移中...", oldRoot)
+
+	// Protected data: zone configs, memory, wiki, knowledge
+	zoneSubs := []string{"memory", "knowledge", "wiki", "workflows", "skills"}
+	for _, sub := range zoneSubs {
+		oldPath := filepath.Join(oldZoneDir, sub)
+		newPath := filepath.Join(newZoneDir, sub)
+		_ = migrateDir(oldPath, newPath)
+	}
+
+	// Zone config files
+	zoneFiles := []string{"config.json", "agents.json", "skills.json",
+		"mcp_servers.json", "a2a_agents.json", "taskboard.json", "evolve_tasks.json"}
+	for _, f := range zoneFiles {
+		_ = migrateFile(filepath.Join(oldZoneDir, f), filepath.Join(newZoneDir, f))
+	}
+
+	// Rebuildable data: models, plugins, downloads, guides
+	runtimeSubs := []string{"models", "plugins", "cache", "guides"}
+	for _, sub := range runtimeSubs {
+		_ = migrateDir(filepath.Join(oldRoot, sub), filepath.Join(newRuntime, sub))
+	}
+
+	// Also migrate plugin-tmp and uploads if they exist
+	_ = migrateDir(filepath.Join(oldRoot, "plugin-tmp"), filepath.Join(newRuntime, "plugins"))
+	_ = migrateDir(filepath.Join(oldRoot, "uploads"), filepath.Join(newRuntime, "downloads"))
+
+	log.Printf("[migrate] 数据迁移完成 → %s", newData)
 }
 
-// oldWdsDataDir returns the legacy data/ directory in the working dir (wails dev).
-func oldWdsDataDir() string {
-	wd, err := os.Getwd()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(wd, "data")
-}
-
-// migrateDir copies a directory tree from oldPath to newPath if oldPath exists
-// and newPath doesn't. Symlinks/junctions are NOT followed (safety).
 func migrateDir(oldPath, newPath string) error {
 	if _, err := os.Stat(oldPath); os.IsNotExist(err) {
-		return nil // nothing to migrate
+		return nil
 	}
 	if _, err := os.Stat(newPath); err == nil {
-		return nil // already migrated
+		return nil // already exists
 	}
 	log.Printf("[migrate] %s → %s", oldPath, newPath)
-	// Ensure parent exists.
 	if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil {
 		return err
 	}
-	// Use rename when on same volume (fast, atomic); fall back to copy.
 	if err := os.Rename(oldPath, newPath); err == nil {
 		return nil
 	}
-	// Cross-volume: copy then rename old as backup.
+	// Cross-volume fallback
 	if err := copyDir(oldPath, newPath); err != nil {
 		return fmt.Errorf("copy %s → %s: %w", oldPath, newPath, err)
 	}
-	backup := oldPath + ".migrated"
-	_ = os.Rename(oldPath, backup)
-	log.Printf("[migrate] 旧目录已备份为 %s", backup)
+	_ = os.Rename(oldPath, oldPath+".migrated")
 	return nil
 }
 
-// migrateFile copies a single file from oldPath to newPath.
 func migrateFile(oldPath, newPath string) error {
 	if _, err := os.Stat(oldPath); os.IsNotExist(err) {
 		return nil
@@ -198,7 +296,6 @@ func migrateFile(oldPath, newPath string) error {
 	return os.WriteFile(newPath, data, 0644)
 }
 
-// copyDir recursively copies a directory tree.
 func copyDir(src, dst string) error {
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -217,107 +314,9 @@ func copyDir(src, dst string) error {
 	})
 }
 
-// MigrateLegacyData moves all data from EXE-relative data/ directories into
-// the canonical %APPDATA%/EverEvo/ tree. Safe to call at every startup —
-// existing data in the new location is never overwritten.
-func MigrateLegacyData() {
-	appRoot, err := rootAppData()
-	if err != nil {
-		log.Printf("[migrate] 无法确定 APPDATA 根目录: %v", err)
-		return
-	}
-	zoneDir := filepath.Join(appRoot, "zones", "production")
-
-	// Check both legacy sources: EXE-relative and CWD-relative.
-	for _, oldRoot := range []string{oldExeDataDir(), oldWdsDataDir()} {
-		if oldRoot == "" {
-			continue
-		}
-		if _, err := os.Stat(oldRoot); os.IsNotExist(err) {
-			continue
-		}
-
-		// ── Directories to migrate ──
-		dirMigrations := []struct{ oldSub, newPath string }{
-			{"models", filepath.Join(appRoot, "models")},
-			{"cache", filepath.Join(appRoot, "cache")},
-			{"plugins", filepath.Join(appRoot, "plugins")},
-			{"plugin-tmp", filepath.Join(appRoot, "plugin-tmp")},
-			{"guides", filepath.Join(appRoot, "guides")},
-			{"skills", filepath.Join(zoneDir, "skills")},
-			{"uploads", filepath.Join(appRoot, "uploads")},
-			{"memory", filepath.Join(zoneDir, "memory")},
-		}
-		for _, m := range dirMigrations {
-			oldPath := filepath.Join(oldRoot, m.oldSub)
-			if st, e := os.Stat(oldPath); e == nil && st.IsDir() {
-				if err := migrateDir(oldPath, m.newPath); err != nil {
-					log.Printf("[migrate] 目录迁移失败 %s: %v", m.oldSub, err)
-				}
-			}
-		}
-
-		// ── Files to migrate (from data/ root) ──
-		fileMigrations := []struct{ oldName, newPath string }{
-			{"mcp_servers.json", filepath.Join(zoneDir, "mcp_servers.json")},
-			{"skills.json", filepath.Join(zoneDir, "skills.json")},
-		}
-		for _, m := range fileMigrations {
-			oldPath := filepath.Join(oldRoot, m.oldName)
-			if _, e := os.Stat(oldPath); e == nil {
-				if err := migrateFile(oldPath, m.newPath); err != nil {
-					log.Printf("[migrate] 文件迁移失败 %s: %v", m.oldName, err)
-				}
-			}
-		}
-	}
-
-	// ── Migrate a2a_agents.json from EXE/data/ ──
-	for _, oldRoot := range []string{oldExeDataDir(), oldWdsDataDir()} {
-		oldPath := filepath.Join(oldRoot, "a2a_agents.json")
-		newPath := filepath.Join(zoneDir, "a2a_agents.json")
-		if _, e := os.Stat(oldPath); e == nil {
-			_ = migrateFile(oldPath, newPath)
-		}
-	}
-}
-
-// ─── Directory creation ────────────────────────────────────────────
-
-// EnsureDataDir creates the canonical APPDATA data directories.
-func EnsureDataDir() error {
-	appRoot, err := rootAppData()
-	if err != nil {
-		return err
-	}
-	zoneDir := filepath.Join(appRoot, "zones", "production")
-
-	for _, p := range []string{
-		filepath.Join(appRoot, "models"),
-		filepath.Join(appRoot, "cache"),
-		filepath.Join(appRoot, "plugins"),
-		filepath.Join(appRoot, "plugin-tmp"),
-		filepath.Join(appRoot, "guides"),
-		filepath.Join(appRoot, "uploads"),
-		zoneDir,
-		filepath.Join(zoneDir, "knowledge"),
-		filepath.Join(zoneDir, "knowledge", "chromem"),
-		filepath.Join(zoneDir, "memory"),
-		filepath.Join(zoneDir, "wiki"),
-		filepath.Join(zoneDir, "wiki", "chromem"),
-		filepath.Join(zoneDir, "workflows"),
-		filepath.Join(zoneDir, "skills"),
-	} {
-		if err := os.MkdirAll(p, 0755); err != nil {
-			return fmt.Errorf("创建目录 %s 失败: %w", p, err)
-		}
-	}
-	return nil
-}
-
 // ─── Model discovery ───────────────────────────────────────────────
 
-// DiscoverModels 遍历给定目录，返回找到的模型文件路径。
+// DiscoverModels walks the given dirs and returns found model file paths.
 func DiscoverModels(dirs []string) []string {
 	var found []string
 	for _, dir := range dirs {

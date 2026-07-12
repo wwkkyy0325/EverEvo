@@ -13,6 +13,10 @@ type ToolDef struct {
 	Description string      `json:"description"`
 	Parameters  *ToolParams `json:"parameters"`
 	Category    string      `json:"category"` // model | plugin | kb | catalog | download | system | toolbox
+	// RawParameters preserves the original MCP inputSchema JSON for external tools,
+	// avoiding JSON Schema fidelity loss from the typed Parameters round-trip.
+	// When set, the frontend and agent-execution paths prefer it over Parameters.
+	RawParameters json.RawMessage `json:"rawParameters,omitempty"`
 	// MCP-specific fields
 	OutputSchema *ToolOutputSchema      `json:"outputSchema,omitempty"`
 	Annotations  *ToolAnnotations       `json:"annotations,omitempty"`

@@ -206,6 +206,7 @@
         <span class="chat-ctx-label">{{ chat.contextPct }}%</span>
       </div>
       <button class="chat-bar-btn" @click="runFullPipeline" title="压缩上下文 + 全处理管线" style="font-size:12px;">↻</button>
+      <ModeSwitcher />
       <div class="chat-bar-spacer"></div>
       <span class="chat-think-label">{{ thinkLevelLabel }}</span>
       <div class="chat-think-dots" ref="thinkDotsRef"
@@ -234,6 +235,7 @@ import { useDataChanged } from '../composables/useDataChanged'
 import { knowledgeApi } from '../api/knowledge'
 import { memoryApi } from '../api/memory'
 import { fmtSize } from '../utils/formatters'
+import ModeSwitcher from "./ModeSwitcher.vue"
 import { useToast } from '../composables/useToast'
 
 defineProps<{ compact?: boolean }>()
@@ -374,14 +376,14 @@ async function runFullPipeline() {
   // Trigger everything: compress context + save summary + extract facts/graph
   await chat.maybeCompressContext()
   // Notify backend to run a full extraction pass on all sessions.
-  try { await window.go.main.App.MemoryForceExtract() } catch (_) {}
+  try { await window.go.app.App.MemoryForceExtract() } catch (_) {}
   toast.show('info', '全处理管线已触发', '上下文压缩 + 事实提取 + 图谱更新')
 }
 
 function stopGeneration() {
   chat.stopRequested = true
   if (chat.currentStreamId) {
-    try { window.go.main.App.ChatStreamCancel(chat.currentStreamId) } catch (_) {}
+    try { window.go.app.App.ChatStreamCancel(chat.currentStreamId) } catch (_) {}
   }
 }
 

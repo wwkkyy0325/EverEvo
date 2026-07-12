@@ -3,7 +3,7 @@
  */
 import { call } from './client'
 
-const App = () => window.go.main.App
+const App = () => window.go.app.App
 
 export interface SysInfo {
   cpu: { vendor: string; name: string; threads: number; features: any[] }

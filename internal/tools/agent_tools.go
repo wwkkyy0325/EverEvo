@@ -16,11 +16,12 @@ func registerAgentTools() {
 		Parameters: &ToolParams{
 			Type: "object",
 			Properties: map[string]ToolProp{
-				"name":        {Type: "string", Description: "Agent 名称（唯一标识，如「翻译专家」）"},
-				"description": {Type: "string", Description: "Agent 用途的简短描述"},
+				"name":         {Type: "string", Description: "Agent 名称（唯一标识，如「翻译专家」）"},
+				"description":  {Type: "string", Description: "Agent 用途的简短描述"},
 				"systemPrompt": {Type: "string", Description: "Agent 的完整系统提示词，定义其人格、能力和行为准则"},
 				"skills": {Type: "array", Description: "授予该 Agent 的能力域名称列表（可选，留空则不授予任何能力）",
 					Items: &ToolProp{Type: "string"}},
+				"libraryId": {Type: "string", Description: "所属领域库 ID（来自 library_list）。不传则使用默认领域"},
 			},
 			Required: []string{"name", "systemPrompt"},
 		},
@@ -86,6 +87,20 @@ func registerAgentTools() {
 				"code":        {Type: "string", Description: "Python 函数代码。函数签名: def tool(args: dict) -> dict:。返回 {'result': ...} 或 {'error': '...'}"},
 			},
 			Required: []string{"name", "code"},
+		},
+	})
+
+	Register(&ToolDef{
+		Name:        "agent_set_library",
+		Description: "将 Agent 移动到指定领域库。用于修正 Agent 归属领域，使其能被 agent_delegate_to_domain 正确委派",
+		Category:    "agent",
+		Parameters: &ToolParams{
+			Type: "object",
+			Properties: map[string]ToolProp{
+				"agentId":   {Type: "string", Description: "Agent ID（来自 agent_list）"},
+				"libraryId": {Type: "string", Description: "目标领域库 ID（来自 library_list）。传空字符串则移回默认领域"},
+			},
+			Required: []string{"agentId", "libraryId"},
 		},
 	})
 }

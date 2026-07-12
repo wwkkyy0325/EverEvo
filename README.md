@@ -63,12 +63,10 @@ Frontend (Vue 3 + Vite) → Go Backend (Wails v2 API)
 ## 构建（Windows）
 
 ```powershell
-.\build.ps1 all      # 前端 + Go + bundle onnxruntime.dll
-.\build.ps1 run      # 运行
-.\build.ps1 dev      # 开发热重载
+.\scripts\build.ps1 all      # 前端 + Go + bundle onnxruntime.dll
+.\scripts\build.ps1 run      # 运行
+.\scripts\build.ps1 dev      # 开发热重载
 ```
-
-Linux/macOS：`make all` / `make dev`（注：ONNX / llama 路径当前 Windows-only）。
 
 ## 用法
 

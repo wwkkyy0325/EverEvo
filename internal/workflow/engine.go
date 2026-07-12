@@ -77,7 +77,7 @@ func NewEngine(wf *WorkflowDef, llm LLMCaller, tool ToolCaller, toolProv ToolPro
 var workflowBlockedTools = map[string]bool{
 	// orchestration (recursion / re-entry)
 	"workflow_execute": true, "workflow_create": true, "workflow_update": true, "workflow_delete": true,
-	"agent_run": true, "agent_create": true, "agent_delegate_to_domain": true, "agent_delegate_multi_domain": true,
+	"agent_run": true, "agent_create": true, "agent_set_library": true, "agent_delegate_to_domain": true, "agent_delegate_multi_domain": true,
 	"agent_synthesize_tool": true,
 	"collab_create": true, "collab_dispatch": true, "collab_dispatch_async": true, "collab_wait": true,
 	"agent_message": true,

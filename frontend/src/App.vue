@@ -2,6 +2,7 @@
   <div class="shell">
     <ToastContainer :toasts="toasts" @remove="removeToast" />
     <ConfirmModal ref="confirmModal" />
+    <AuditDialog />
 
     <aside class="sidebar" :class="{ collapsed: sidebarCollapsed }">
       <div class="sidebar-top">
@@ -106,6 +107,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import ToastContainer from './components/ToastContainer.vue'
+import AuditDialog from "./components/AuditDialog.vue"
 import ConfirmModal from './components/ConfirmModal.vue'
 import AccountMenu from './components/AccountMenu.vue'
 import ChatPanel from './components/ChatPanel.vue'

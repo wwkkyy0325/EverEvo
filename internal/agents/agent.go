@@ -314,6 +314,19 @@ func (m *Manager) EnsureLibraryIDs(defaultLibraryID string, validIDs []string) e
 	return nil
 }
 
+// SetLibrary changes an agent's library/domain association and persists.
+func (m *Manager) SetLibrary(agentID, libraryID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.Agents {
+		if m.Agents[i].ID == agentID {
+			m.Agents[i].LibraryID = libraryID
+			return m.saveLocked()
+		}
+	}
+	return fmt.Errorf("agent %q 不存在", agentID)
+}
+
 // newID returns a short unique ID (8 random hex chars + unix seconds base36-ish).
 func newID() string {
 	b := make([]byte, 6)

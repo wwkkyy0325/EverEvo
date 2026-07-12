@@ -1,10 +1,8 @@
-# Rust
-engine/target/
-
 # Go
 *.exe
 *.exe~
 build/bin/
+build/windows/
 
 # Frontend
 frontend/dist/
@@ -17,11 +15,6 @@ data/
 # Binary dependencies
 *.dll
 third_party/
-
-# Wails build artifacts
-build/windows/
-*.manifest
-*.sgo
 
 # Build artifacts
 frontend/package.json.md5
@@ -44,5 +37,6 @@ Thumbs.db
 
 # Backups
 *.bak
-build/appicon.png
 *.syso
+runtime/*
+workspace/*

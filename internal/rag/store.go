@@ -475,6 +475,19 @@ func (s *Store) DeleteCollection(name string) error {
 	return nil
 }
 
+// SetKBLibrary changes a KB's library/domain association and persists metadata.
+func (s *Store) SetKBLibrary(kbID, libraryID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kb, ok := s.meta[kbID]
+	if !ok {
+		return fmt.Errorf("知识库不存在: %s", kbID)
+	}
+	kb.LibraryID = libraryID
+	s.saveMetaLocked()
+	return nil
+}
+
 // UpdateKBModelDir changes a KB's bound embedding model dir. Only safe when the
 // KB has no documents; use MigrateKBModel to re-embed existing docs.
 func (s *Store) UpdateKBModelDir(kbID, newDir string) error {

@@ -37,7 +37,7 @@ A minimal repro test calling `onnx.LoadModel` directly captured the stack:
   pass `nil` so the session derives shape/dtype from metadata.
 - [x] `app.go` — `shutdown` calls `onnx.Close()` after `manager.Shutdown()`.
 - [x] Bundle ONNX Runtime 1.26 DLL: `third_party/onnxruntime/win-x64/onnxruntime.dll`
-  + `Bundle-Runtime` step in `build.ps1` (all/build/package).
+  + `Bundle-Runtime` step in `scripts/build.ps1` (all/build/package).
 - [x] Repurposed `repro_test.go` → `TestLoadAndRun` smoke test.
 
 ## Verification
@@ -46,7 +46,7 @@ A minimal repro test calling `onnx.LoadModel` directly captured the stack:
 - [x] `go test -run TestLoadAndRun ./internal/backends/onnx/` ✓ — loads MiniLM
   (3 inputs: input_ids/attention_mask/token_type_ids, 1 output), runs inference,
   output 3072 B = `[1,2,384]` float32. No crash.
-- [ ] End-to-end via `build.ps1 build` + click 加载 in the app (deferred — same code
+- [ ] End-to-end via `scripts/build.ps1 build` + click 加载 in the app (deferred — same code
   path as the passing test).
 
 ## Follow-ups (out of scope)

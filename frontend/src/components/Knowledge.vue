@@ -322,8 +322,8 @@
       </div>
     </div>
 
-    <!-- Unified RAG search + KB accordion (non-core domains only) -->
-    <div v-if="!isCoreDomain" class="glass-panel mem-panel">
+    <!-- Unified RAG search + KB accordion -->
+    <div class="glass-panel mem-panel">
       <div class="mem-head">
         <span class="mem-icon">🔍</span>
         <span class="mem-title">知识检索</span>
@@ -336,10 +336,16 @@
         <button class="btn btn-primary" @click="doRagSearch" :disabled="busy || !ragQuery.trim()">搜索</button>
       </div>
       <div v-if="ragBusy" class="mem-hint" style="text-align:center;">搜索中...</div>
-      <div v-if="ragResults.length" class="mem-list" style="max-height:300px;">
-        <div v-for="r in ragResults" :key="r.id" class="mem-item">
-          <span class="mem-kind" style="background:var(--accent-dim);color:var(--accent);font-size:10px;">{{ (r.similarity * 100).toFixed(0) }}%</span>
-          <span class="mem-text">{{ r.content }}</span>
+      <div v-if="ragResults.length" class="mem-list" style="max-height:420px;">
+        <div v-for="(r, i) in ragResults" :key="i" class="mem-item rag-result-item" @click="expandRagResult(i)">
+          <div style="flex:1;min-width:0;cursor:pointer;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;">
+              <span class="mem-kind" style="background:var(--accent-dim);color:var(--accent);font-size:10px;">{{ (r.similarity * 100).toFixed(0) }}%</span>
+              <span style="font-size:0.75em;color:var(--accent);">{{ r.source || r.metadata?.source || r.metadata?.filename || '—' }}</span>
+            </div>
+            <div class="mem-text" v-if="ragExpanded === i || r.content.length <= 200">{{ r.content }}</div>
+            <div class="mem-text" v-else>{{ r.content.slice(0, 200) }}… <span style="color:var(--accent);font-size:0.8em;">点击展开</span></div>
+          </div>
         </div>
       </div>
       <div v-if="ragSearched && !ragResults.length" class="mem-hint" style="text-align:center;">未找到相关知识</div>
@@ -351,24 +357,30 @@
           <div class="kb-acc-head" @click="toggleKB(kb.id)">
             <span class="kb-acc-arrow">{{ activeKB === kb.id ? '▾' : '▸' }}</span>
             <span class="kb-acc-name">{{ kb.name }}</span>
+            <span class="kb-acc-model" :class="{ 'kb-model-bound': kb.modelDir, 'kb-model-unbound': !kb.modelDir }">{{ kb.modelDir ? kbModelName(kb.modelDir) : '⚠ 未绑定模型' }}</span>
             <span class="kb-acc-count">{{ kb.chunkCount || 0 }} 条</span>
-            <button class="btn btn-xs btn-danger" @click.stop="doDelete(kb.id)" :disabled="busy" style="margin-left:auto;">✕</button>
+            <button v-if="!isCoreDomain" class="btn btn-xs btn-danger" @click.stop="doDelete(kb.id)" :disabled="busy" style="margin-left:auto;">✕</button>
           </div>
           <div v-if="activeKB === kb.id" class="kb-acc-body">
-            <div class="kb-model-row">
+            <div v-if="!embedModels.length" class="mem-hint" style="padding:8px 0;text-align:center;">
+              ⚠ 未检测到句向量模型，请先在模型市场下载 sentence-embedding 模型<br/>
+              <span style="font-size:0.8em;color:#777;">下载后刷新页面即可绑定知识库</span>
+            </div>
+            <div v-else class="kb-model-row">
               <span class="kb-model-label">模型</span>
-              <select class="kb-model-select" :value="kbModelDraft[kb.id]" @change="kbModelDraft[kb.id] = ($event.target as HTMLSelectElement).value" :disabled="busy">
+              <select class="kb-model-select" :value="kbModelDraft[kb.id] || kb.modelDir" @change="kbModelDraft[kb.id] = ($event.target as HTMLSelectElement).value" :disabled="busy">
                 <option v-for="m in embedModels" :key="m.dir" :value="m.dir">{{ m.name }}</option>
               </select>
               <button class="btn btn-sm btn-primary" @click="applyKBModel(kb)" :disabled="busy || !kbModelDraft[kb.id] || kbModelDraft[kb.id] === kb.modelDir">
-                {{ (kb.chunkCount || 0) > 0 ? '迁移' : '换绑' }}
+                {{ !kb.modelDir ? '绑定' : (kb.chunkCount || 0) > 0 ? '迁移' : '换绑' }}
               </button>
             </div>
-            <KnowledgeAddText :kb-id="kb.id" :busy="busy" @done="onTabDone" />
+            <KnowledgeAddText v-if="kb.modelDir" :kb-id="kb.id" :busy="busy" @done="onTabDone" />
+            <div v-else class="mem-hint" style="text-align:center;padding:8px 0;">请先绑定句向量模型，才能添加文档</div>
           </div>
         </div>
       </div>
-      <div v-if="!kbs.length && !isCoreDomain" class="mem-hint" style="text-align:center; padding:12px 0;">暂无知识库，点击「+ 新建」创建</div>
+      <div v-if="!kbs.length" class="mem-hint" style="text-align:center; padding:12px 0;">{{ isCoreDomain ? '暂无知识库，可通过导入功能创建' : '暂无知识库，点击「+ 新建」创建' }}</div>
     </div>
 
     <!-- 新建知识库面板 -->
@@ -525,10 +537,12 @@ const ragQuery = ref('')
 const ragResults = ref<any[]>([])
 const ragBusy = ref(false)
 const ragSearched = ref(false)
+const ragExpanded = ref(-1)
+function expandRagResult(i: number) { ragExpanded.value = ragExpanded.value === i ? -1 : i }
 async function doRagSearch() {
   const q = ragQuery.value.trim()
   if (!q || !kbs.value.length) return
-  ragBusy.value = true; ragSearched.value = true
+  ragBusy.value = true; ragSearched.value = true; ragExpanded.value = -1
   try {
     const all: any[] = []
     for (const kb of kbs.value) {
@@ -862,6 +876,11 @@ function toggleKB(id: string) {
   kbDocs.value = []
   const kb = kbs.value.find(k => k.id === id)
   if (kb) kbModelDraft[id] = kb.modelDir
+}
+
+function kbModelName(dir: string): string {
+  const m = embedModels.value.find((x: any) => x.dir === dir)
+  return m ? m.name : dir.slice(Math.max(0, dir.lastIndexOf('/') + 1))
 }
 
 function onTabDone() {
@@ -1363,7 +1382,14 @@ useDataChanged('wiki:changed', () => { refreshAll() })
 .kb-acc-head:hover { background: rgba(255,255,255,0.04); }
 .kb-acc-arrow { font-size: 10px; color: var(--text-tertiary); width: 14px; flex-shrink: 0; }
 .kb-acc-name { font-weight: 550; color: var(--text-primary); flex: 1; }
+.kb-acc-model { font-size: 10px; padding: 1px 6px; border-radius: 8px; flex-shrink: 0; }
+.kb-model-bound { background: #1a2a1a; color: #5a5; }
+.kb-model-unbound { background: #2a1a1a; color: #a55; }
 .kb-acc-count { font-size: 10px; color: var(--text-tertiary); }
+
+/* RAG result items */
+.rag-result-item { cursor: pointer; transition: background .15s; flex-direction: column; align-items: stretch; }
+.rag-result-item:hover { background: #1e1e24; }
 .kb-acc-body { padding: 8px 10px 4px; border-top: 1px solid var(--border-subtle); }
 .kb-model-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
 .kb-model-label { font-size: 11px; color: var(--text-tertiary); flex-shrink: 0; }

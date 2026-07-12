@@ -115,12 +115,16 @@ func executeLLM(eng *Engine, node *WorkflowNode) (any, error) {
 			}
 			var wrapped []toolWrap
 			for _, t := range tools {
+				params := t.Parameters
+				if len(t.RawParameters) > 0 {
+					params = t.RawParameters
+				}
 				wrapped = append(wrapped, toolWrap{
 					Type: "function",
 					Function: toolFn{
 						Name:        t.Name,
 						Description: t.Description,
-						Parameters:  t.Parameters,
+						Parameters:  params,
 					},
 				})
 			}
@@ -912,9 +916,10 @@ type ToolProvider interface {
 
 // ToolDefInfo is a lightweight tool definition for the engine.
 type ToolDefInfo struct {
-	Name        string
-	Description string
-	Parameters  any
+	Name          string
+	Description   string
+	Parameters    any
+	RawParameters json.RawMessage // preserved MCP inputSchema when available
 }
 
 // EventEmitter emits workflow execution events.

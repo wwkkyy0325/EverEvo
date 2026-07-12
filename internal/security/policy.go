@@ -97,7 +97,7 @@ func (p *Policy) CheckFilePath(path string, write bool) (allowed bool, reason st
 // ─── Persistence ────────────────────────────────────────────────
 
 func policyPath() string {
-	dir, _ := storage.DataDir()
+	dir := storage.DataDir()
 	return filepath.Join(dir, "security_policy.json")
 }
 
@@ -136,7 +136,7 @@ type AuditEntry struct {
 }
 
 func auditPath() string {
-	dir, _ := storage.DataDir()
+	dir := storage.DataDir()
 	return filepath.Join(dir, "audit.log")
 }
 

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"reflect"
 	"sort"
 	"sync"
 )
@@ -113,7 +114,14 @@ func RegisterAll() {
 // ─── helpers ────────────────────────────────────────────────────
 
 // OkResult wraps a successful value into a ToolResult.
+// Nil slices are coerced to empty arrays so JSON output is [] not null.
 func OkResult(v any) ToolResult {
+	if v != nil {
+		rv := reflect.ValueOf(v)
+		if rv.Kind() == reflect.Slice && rv.IsNil() {
+			v = reflect.MakeSlice(rv.Type(), 0, 0).Interface()
+		}
+	}
 	data, _ := json.Marshal(v)
 	return ToolResult{Success: true, Data: data}
 }

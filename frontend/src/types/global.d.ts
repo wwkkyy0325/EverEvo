@@ -10,7 +10,7 @@ declare module '*.vue' {
 declare global {
   interface Window {
     go: {
-      main: {
+      app: {
         App: Record<string, (...args: any[]) => Promise<any>>
       }
     }
@@ -18,6 +18,8 @@ declare global {
       EventsOn: (event: string, callback: (...args: any[]) => void) => (() => void) | void
       EventsOff: (event: string, callback?: (...args: any[]) => void) => void
       EventsEmit?: (event: string, data?: any) => void
+      BrowserOpenURL: (url: string) => void
+      OpenFileDialog: (opts?: any) => Promise<string>
     }
   }
 }
