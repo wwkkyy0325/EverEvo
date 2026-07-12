@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"everevo/internal/httpclient"
 	"os/exec"
@@ -153,21 +154,32 @@ func (t *stdioTransport) Send(method string, params any) (json.RawMessage, error
 		return nil, fmt.Errorf("write: %w", err)
 	}
 
-	line, err := t.stdout.ReadString('\n')
-	if err != nil {
-		tail := t.stderrTail()
-		if tail != "" {
-			return nil, fmt.Errorf("read: %w\nstderr: %s", err, tail)
+	// Read response, skipping up to 3 non-JSON banner lines that cmd.exe /
+	// npm sporadically emit on Windows before the first JSON-RPC response.
+	var line string
+	for attempt := 0; attempt < 4; attempt++ {
+		raw, err := t.stdout.ReadString('\n')
+		if err != nil {
+			tail := t.stderrTail()
+			if tail != "" {
+				return nil, fmt.Errorf("read: %w\nstderr: %s", err, tail)
+			}
+			if t.isExited() {
+				return nil, fmt.Errorf("read: %w (process exited)", err)
+			}
+			return nil, fmt.Errorf("read: %w", err)
 		}
-		// If process exited, mention that explicitly
-		if t.isExited() {
-			return nil, fmt.Errorf("read: %w (process exited)", err)
+		line = strings.TrimSpace(raw)
+		if line == "" {
+			continue
 		}
-		return nil, fmt.Errorf("read: %w", err)
+		if len(line) > 0 && line[0] == '{' {
+			break // JSON start — valid response
+		}
+		log.Printf("[mcp stdio] banner skipped (attempt %d): %s", attempt+1, strings.TrimSpace(raw))
 	}
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return nil, fmt.Errorf("empty response")
+	if len(line) == 0 || line[0] != '{' {
+		return nil, fmt.Errorf("no valid JSON response after banner filter (got: %s)", line)
 	}
 
 	var resp jsonRPCResponse

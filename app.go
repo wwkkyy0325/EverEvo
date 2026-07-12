@@ -4,10 +4,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 	"sync"
 
 	"everevo/internal/backends"
@@ -22,16 +25,20 @@ import (
 	"everevo/internal/model"
 	"everevo/internal/storage"
 	"everevo/internal/sysinfo"
+	"everevo/internal/taskboard"
 	"everevo/internal/wiki"
 
 	"everevo/internal/a2a"
+	"everevo/internal/acp"
 	"everevo/internal/agents"
+	"everevo/internal/collab"
 	"everevo/internal/feishu"
 	"everevo/internal/mcp"
 	mcpclient "everevo/internal/mcp/client"
 	"everevo/internal/skills"
 	"everevo/internal/tools"
 	"everevo/internal/workflow"
+	"everevo/internal/zone"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -54,11 +61,17 @@ type App struct {
 	memoryStore     *memory.Store
 	guideManager    *guides.Manager
 	workflowManager *workflow.Manager
+	collab          *collab.Kernel
+	activityQueue   chan memory.ActivityRow            // unified AI-work log write queue
 	memSweepDone    chan struct{}
 	wikiStores      map[string]*wiki.Store           // per-library wiki stores, keyed by libraryID
 	wikiStoreMu     sync.RWMutex
 	streamCancelMu  sync.Mutex
 	streamCancels   map[string]context.CancelFunc    // streamID → cancel
+	zone            *zone.Zone                        // current runtime zone
+	sourceDir       string                             // project root for self-compilation ("" if unavailable)
+	acpBridge       *acp.Bridge                        // OpenCode ACP bridge for code modification tasks
+	taskBoard       *taskboard.Board                    // cross-conversation progress tracking
 }
 
 // NewApp 创建应用实例。
@@ -116,6 +129,12 @@ func (a *App) startup(ctx context.Context) {
 
 	// 日志同时写到文件和终端（dev 模式下终端可见，生产 EXE 只看文件）
 	storage.EnsureDataDir()
+	// Migrate legacy data from EXE-relative paths to APPDATA.
+	storage.MigrateLegacyData()
+
+	// Ensure this zone exists and allocate ports.
+	a.initZone()
+
 	dataDir, _ := storage.AppDataDir()
 	logPath := filepath.Join(dataDir, "EverEvo.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -162,6 +181,8 @@ func (a *App) startup(ctx context.Context) {
 	if err := storage.EnsureDataDir(); err != nil {
 		log.Printf("⚠ 创建数据目录失败: %v", err)
 	} else {
+		// Migrate legacy data from EXE-relative paths to APPDATA.
+		storage.MigrateLegacyData()
 		dir, _ := storage.DataDir()
 		modelsDir, _ := storage.ModelsDir()
 		log.Printf("数据目录: %s", dir)
@@ -221,6 +242,29 @@ func (a *App) startup(ctx context.Context) {
 	a.agentManager = agents.NewManager()
 	log.Printf("已加载 %d 个本地 Agent", len(a.agentManager.List()))
 
+	// Initialize collaboration kernel (event bus, blackboard, dispatcher).
+	// Forwards backend collab events to the Wails frontend for visualization,
+	// AND records every event into the unified activity log (single chokepoint).
+	// The dispatcher is created local-only here; remote delivery is wired
+	// after the A2A manager starts (see below).
+	a.activityQueue = make(chan memory.ActivityRow, activityQueueCap) // allocated early so collab.ready etc. are captured
+	a.collab = collab.NewKernel(func(topic string, data any) {
+		if ev, ok := data.(collab.Event); ok {
+			a.recordActivity(topic, ev)
+		}
+		if a.ctx != nil {
+			wailsRuntime.EventsEmit(a.ctx, "collab:event", map[string]any{"topic": topic, "data": data})
+		}
+	})
+	a.collab.SetDispatcher(collab.NewDispatcher(a.collab, agentRunnerAdapter{a: a}, nil))
+	for _, ag := range a.agentManager.List() {
+		a.collab.Dispatch.RegisterLocal(ag.ID)
+	}
+	log.Println("协同内核就绪 (event bus + blackboard + dispatcher)")
+	// Handshake: notify the frontend workbench that the kernel is live, so its
+	// "连接中" badge can flip to "已连接·空闲" even with zero collaboration activity.
+	a.collab.Bus.Publish("collab.ready", collab.Event{Type: "ready"})
+
 	// Initialize MCP Client — auto-connect external MCP servers
 	a.mcpClient = mcpclient.NewManager()
 	a.mcpClient.LoadAndConnect()
@@ -229,13 +273,25 @@ func (a *App) startup(ctx context.Context) {
 	a.initA2AManager()
 	log.Println("A2A Agent 管理器就绪")
 
+	// Wire remote agent delivery into the collaboration dispatcher now that
+	// the A2A manager (and its remote-agent client connections) are ready.
+	if a.collab != nil && a.collab.Dispatch != nil {
+		a.collab.Dispatch.SetRemote(a2aRemoteAdapter{a: a})
+	}
+
 	// Initialize Feishu bot (WebSocket long-connection to Feishu)
 	a.initFeishuClient()
 	log.Println("飞书机器人就绪")
 
-	// Initialize guide manager
-	a.guideManager = guides.NewManager()
+	// Initialize guide manager. On first run it seeds the bundled EverEvo usage
+	// guides (local source); trigger an initial sync so the Guide Center is
+	// populated immediately rather than showing "0 来源 0 文档".
+	var guidesSeeded bool
+	a.guideManager, guidesSeeded = guides.NewManager()
 	log.Printf("已加载 %d 个攻略来源", len(a.guideManager.ListSources()))
+	if guidesSeeded {
+		go a.guideManager.SyncAll()
+	}
 
 	// Initialize workflow manager
 	a.workflowManager = workflow.NewManager()
@@ -264,22 +320,134 @@ func (a *App) startup(ctx context.Context) {
 
 	// P5: compute hardware-adaptive memory policy (RAM/disk → tier → params).
 	a.applyMemoryPolicy()
+
+	// Wire blackboard persistence to SQLite.
+	a.collab.SetBlackboardPersistFn(func(boardID, key, value, author, kind string, updatedAt time.Time) {
+		if a.memoryStore == nil {
+			return
+		}
+		if value == "" && kind == "" {
+			_ = a.memoryStore.BBDeleteEntry(boardID, key)
+		} else {
+			_ = a.memoryStore.BBSaveEntry(boardID, key, value, author, kind, updatedAt.UnixMilli())
+		}
+	})
+	a.collab.SetBlackboardLoadFn(func(boardID string) []collab.Entry {
+		if a.memoryStore == nil {
+			return nil
+		}
+		rows, err := a.memoryStore.BBLoadEntries(boardID)
+		if err != nil {
+			return nil
+		}
+		out := make([]collab.Entry, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, collab.Entry{
+				Key: r.Key, Value: r.Value, Author: r.Author,
+				Kind: r.Kind, UpdatedAt: time.UnixMilli(r.UpdatedAt),
+			})
+		}
+		return out
+	})
+
+	// Restore active collaboration sessions now that the memory store is ready.
+	// (Must run AFTER memoryStore init — earlier the guard was always nil.)
+	if a.collab != nil && a.memoryStore != nil {
+		if rows, err := a.memoryStore.ListCollabSessions(); err == nil {
+			for _, r := range rows {
+				if r.Status != collab.SessionActive {
+					continue
+				}
+				var members []collab.Member
+				for _, m := range r.Members {
+					members = append(members, collab.Member{AgentID: m.AgentID, Role: m.Role})
+				}
+				a.collab.Sessions.Restore(r.ID, r.Goal, r.OrchestratorID, r.BlackboardID, r.Status, members, time.UnixMilli(r.CreatedAt))
+			}
+			if len(rows) > 0 {
+				log.Printf("[collab] 恢复 %d 个协同会话", len(rows))
+			}
+		}
+		// Restore active plans from the JSON snapshot.
+		if a.collab != nil {
+			if dir, dErr := storage.AppDataDir(); dErr == nil {
+				if n, err := a.collab.Plans.RestoreFrom(filepath.Join(dir, "plans.json")); err == nil && n > 0 {
+					log.Printf("[collab] 恢复 %d 个计划", n)
+				}
+			}
+		}
+	}
+	// Initialize OpenCode ACP bridge for code modification delegation.
+	a.acpBridge = acp.NewBridge(acp.DefaultExe)
+	log.Println("ACP 桥接就绪 (OpenCode)")
+
+	// Auto-resume ACP evolve tasks that were interrupted mid-flight.
+	a.ResumeAcpEvolveTasks()
+
+	// Resume pending evolve tasks (e.g. a swap that was interrupted mid-restart).
+	// 同时检测重启标记：区分「自进化重启」和「普通崩溃重启」。
+	if marker := a.readRestartMarker(); marker != nil {
+		log.Printf("[evolve] 🔄 检测到自进化重启 (reason=%s, task=%s, time=%s)", marker.Reason, marker.TaskID, marker.Timestamp)
+	} else {
+		log.Println("[evolve] ℹ 未检测到重启标记（普通启动或首次运行）")
+	}
+	if pending := a.ResumeEvolveTasks(); len(pending) > 0 {
+		log.Printf("[evolve] ⚠ %d 个任务需要跟进（详见 wiki 的 evolve/next_action）", len(pending))
+	}
+
 	// P5: boot + daily TTL sweep of expired episodic memory (core layer untouched).
 	a.memSweepDone = make(chan struct{})
 	go a.runMemorySweep()
+	// Unified activity log writer: drains activityQueue (fed by the collab bus
+	// forward callback + workflow bridge) into SQLite, off the event bus.
+	go a.runActivityWriter()
 
 	// P7: seed default workspace + domain library
 	if a.memoryStore != nil {
 		_, _ = a.memoryStore.DefaultWorkspace()
 		libID, _ := a.memoryStore.DefaultLibrary()
-		// Backfill legacy agents with the default library ID.
+		// Collect valid domain library IDs for dangling-reference repair.
+		validIDs := a.memoryStore.ListLibraryIDs()
+
+		// Backfill legacy agents with the default library ID (fixes empty + dangling).
 		if libID != "" && a.agentManager != nil {
-			_ = a.agentManager.EnsureLibraryIDs(libID)
+			_ = a.agentManager.EnsureLibraryIDs(libID, validIDs)
 		}
-			// Migrate legacy 'default' workspace_id to actual library ID.
-			if libID != "" && a.memoryStore != nil {
-			a.memoryStore.MigrateDefaultWorkspace(libID)
+		// P10: Backfill MCP servers + Skills + KBs with default library ID.
+		if libID != "" {
+			if a.mcpClient != nil {
+				a.mcpClient.BackfillLibraryIDs(libID, validIDs)
+					// Heuristic reassignment: move MCP servers from default
+					// to matching domains (e.g. SearXNG→搜索, GitHub→开发).
+					if libs, err := a.memoryStore.LibraryList(); err == nil {
+						nameToID := make(map[string]string)
+						for _, l := range libs {
+							nameToID[l.Name] = l.ID
+						}
+						a.mcpClient.ReassignByHeuristic(libID, nameToID)
+					}
 			}
+			if a.skillManager != nil {
+				_ = a.skillManager.EnsureLibraryIDs(libID, validIDs)
+			}
+			// Backfill KB library IDs (fixes empty + dangling, e.g. orphan lib_18c0842c0b947f70).
+			if ragStore, err := a.getRagStore(); err == nil {
+				ragStore.BackfillLibraryIDs(libID, validIDs)
+			}
+			// One-time historical fact dedup (memory_items.fact + user_facts).
+			if a.memoryStore != nil {
+				_ = a.memoryStore.DedupAllFacts()
+				if removed, err := a.memoryStore.DedupUserFacts(); err == nil && removed > 0 {
+					log.Printf("[memory] 核心记忆(user_facts)去重完成: 移除 %d 条", removed)
+				}
+				// Prune auto-created libraries that never received any data.
+				a.memoryStore.PruneEmptyAutoLibraries()
+			}
+		}
+		// Migrate legacy 'default' workspace_id to actual library ID.
+		if libID != "" && a.memoryStore != nil {
+			a.memoryStore.MigrateDefaultWorkspace(libID)
+		}
 	}
 
 	// P6.1: wiki index — per-library, lazy-init. Core library indexes docs/ at boot.
@@ -295,11 +463,47 @@ func (a *App) startup(ctx context.Context) {
 	// P9: start dream pipeline scheduler (Light→REM→Deep).
 	a.startDreamScheduler()
 
+	// Task board: cross-conversation progress tracking. Loads from JSON,
+	// falls back to wiki backup, creates empty if neither exists.
+	a.loadTaskBoard()
 
-	// Start the internal MCP server (auto-started when port is configured).
-	if a.cfg.LLM.MCPPort > 0 {
-		a.StartMCPServer()
+	// Start the internal MCP server. Auto-start with a default port when no
+	// port is configured (previously stayed off — mcp_status showed port:0 and
+	// external MCP clients couldn't reach EverEvo). Persist the chosen port.
+	if a.cfg.LLM.MCPPort <= 0 {
+		a.cfg.LLM.MCPPort = 19400
+		config.Save(a.cfg)
 	}
+	a.StartMCPServer()
+}
+
+// ─── Domain validation helpers ──────────────────────────────────────
+
+// validateLibraryID checks that the given library ID is non-empty and points to
+// an existing domain_libraries row. Used by all create-entity APIs to enforce
+// domain-as-container invariants.
+func (a *App) validateLibraryID(libraryID string) error {
+	if libraryID == "" {
+		return fmt.Errorf("领域 ID 不能为空")
+	}
+	if a.memoryStore != nil && !a.memoryStore.IsValidLibrary(libraryID) {
+		return fmt.Errorf("领域 %q 不存在", libraryID)
+	}
+	return nil
+}
+
+// resolveLibraryID returns the given library ID if non-empty; otherwise returns
+// the default library ID. Used by list/query APIs for backward compatibility.
+func (a *App) resolveLibraryID(libraryID string) string {
+	if libraryID != "" {
+		return libraryID
+	}
+	if a.memoryStore != nil {
+		if id, err := a.memoryStore.DefaultLibrary(); err == nil {
+			return id
+		}
+	}
+	return ""
 }
 
 // ─── Startup helpers ──────────────────────────────────────────────
@@ -346,9 +550,161 @@ func detectEmbeddingModelDir() string {
 
 // ─── Knowledge Graph — P2 view (frontend graph viewer) ───────────
 
+// initZone ensures the current runtime zone exists on disk with an up-to-date
+// manifest. It allocates ports and creates the zone directory if this is the
+// first launch after upgrading.
+func (a *App) initZone() {
+	zoneName := os.Getenv("EVEREVO_ZONE")
+	if zoneName == "" {
+		zoneName = "production"
+	}
+
+	z, err := zone.Get(zoneName)
+	if err != nil {
+		// First launch — create the production zone from scratch.
+		log.Printf("[zone] 首次启动，创建 %q 运行区", zoneName)
+		isProd := zoneName == "production"
+		zoneType := zone.TypeExperiment
+		if isProd {
+			zoneType = zone.TypeProduction
+		}
+
+		// For production, create an empty zone.
+		dir := zone.Dir(zoneName)
+		if mkErr := os.MkdirAll(dir, 0755); mkErr != nil {
+			log.Printf("[zone] 创建 zone 目录失败: %v", mkErr)
+			return
+		}
+
+		// Allocate ports.
+		mcpPort, a2aPort, pErr := zone.Allocate(zoneName, isProd)
+		if pErr != nil {
+			log.Printf("[zone] 端口分配失败: %v", pErr)
+			return
+		}
+
+		m := zone.Manifest{
+			Name:      zoneName,
+			Type:      zoneType,
+			CreatedAt: time.Now(),
+			MCPPort:   mcpPort,
+			A2APort:   a2aPort,
+		}
+		_ = zone.WriteManifest(dir, &m)
+		z = &zone.Zone{
+			Name:      zoneName,
+			Dir:       dir,
+			Type:      zoneType,
+			MCPPort:   mcpPort,
+			A2APort:   a2aPort,
+			CreatedAt: time.Now(),
+		}
+	}
+
+	a.zone = z
+	log.Printf("[zone] 运行区: %s (type=%s, mcp=%d, a2a=%d)", z.Name, z.Type, z.MCPPort, z.A2APort)
+
+	// Detect source code directory for self-evolution (rebuild from source).
+	a.detectSourceDir()
+}
+
+// detectSourceDir finds the project root (containing go.mod + main.go) for
+// self-compilation. Walks up from the EXE directory through ancestor chains,
+// then falls back to the working directory.
+//
+// Typical layouts that Just Work:
+//
+//	EXE at build/bin/everevo.exe     → source at ../..  (wails build)
+//	EXE at project root/everevo.exe  → source at .      (user copies EXE to root)
+//	EXE anywhere, wd = project root  → source at wd     (wails dev)
+func (a *App) detectSourceDir() {
+	exe, _ := os.Executable()
+	exeDir := filepath.Dir(exe)
+
+	// Strategy 1: walk UP from EXE directory looking for go.mod + main.go.
+	// This covers the common case: build/bin/everevo.exe → project root.
+	var candidates []string
+	for d := exeDir; d != "" && d != filepath.Dir(d); d = filepath.Dir(d) {
+		candidates = append(candidates, d)
+		// Don't walk past 5 levels — if we haven't found it by then, it's not here.
+		if len(candidates) >= 5 {
+			break
+		}
+	}
+
+	// Strategy 2: working directory (wails dev mode).
+	if wd, err := os.Getwd(); err == nil {
+		absWd, _ := filepath.Abs(wd)
+		candidates = append(candidates, absWd)
+	}
+
+	// Strategy 3: common relative paths from EXE dir (belt-and-suspenders).
+	for _, rel := range []string{"..", "..\\..", "..\\..\\.."} {
+		candidates = append(candidates, filepath.Join(exeDir, rel))
+	}
+
+	// Deduplicate while preserving order.
+	seen := map[string]bool{}
+	var unique []string
+	for _, d := range candidates {
+		abs, err := filepath.Abs(d)
+		if err != nil {
+			continue
+		}
+		abs = filepath.Clean(abs)
+		if !seen[abs] {
+			seen[abs] = true
+			unique = append(unique, abs)
+		}
+	}
+
+	// Check each candidate for go.mod (with module "everevo") + main.go.
+	for _, d := range unique {
+		if isEverEvoRoot(d) {
+			a.sourceDir = d
+			exeRel := ""
+			if rel, err := filepath.Rel(d, exeDir); err == nil {
+				exeRel = rel
+			}
+			log.Printf("[evolve] ✓ 源码目录: %s (EXE 相对路径: %s\\)", d, exeRel)
+			log.Printf("[evolve]   构建产物: %s", filepath.Join(d, "build", "bin", "everevo.exe"))
+			return
+		}
+	}
+
+	log.Println("[evolve] ℹ 未找到源码目录（go.mod + main.go），源码级自进化不可用")
+	log.Println("[evolve]   将 EXE 放到项目根目录或在项目根目录运行即可启用")
+}
+
+// isEverEvoRoot checks whether a directory is the EverEvo project root.
+func isEverEvoRoot(dir string) bool {
+	gomod := filepath.Join(dir, "go.mod")
+	mainGo := filepath.Join(dir, "main.go")
+	if _, e1 := os.Stat(gomod); e1 != nil {
+		return false
+	}
+	if _, e2 := os.Stat(mainGo); e2 != nil {
+		return false
+	}
+	// Quick sanity: go.mod should mention "everevo".
+	data, err := os.ReadFile(gomod)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), "module everevo")
+}
+
 // shutdown is called by Wails before the app exits.
 func (a *App) shutdown(ctx context.Context) {
 	log.Println("应用关闭中……")
+	// Clean up zone: clear PID entry in manifest (ports are released on
+	// next startup's port scan or when explicitly stopped via Launch/Stop).
+	if a.zone != nil {
+		if m, err := zone.ReadManifest(a.zone.Dir); err == nil {
+			m.PID = 0
+			_ = zone.WriteManifest(a.zone.Dir, m)
+		}
+	}
 	if a.chatCancel != nil {
 		a.chatCancel()
 	}

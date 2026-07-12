@@ -14,14 +14,14 @@ import (
 // it once for turns/facts/graph), avoiding double-embedding. Returns "" (no error)
 // when there are no seeds or no edges, so the caller can no-op cleanly — matching
 // MemoryRecall's zero-impact degradation contract.
-func (s *Store) RetrieveGraph(emb []float32, k int) (string, error) {
+func (s *Store) RetrieveGraph(emb []float32, k int, libraryID string) (string, error) {
 	if len(emb) == 0 {
 		return "", nil
 	}
 	if k <= 0 {
 		k = 3
 	}
-	seeds, err := s.EntitySearch(emb, k)
+	seeds, err := s.EntitySearch(emb, k, libraryID)
 	if err != nil || len(seeds) == 0 {
 		return "", nil
 	}
@@ -34,7 +34,7 @@ func (s *Store) RetrieveGraph(emb []float32, k int) (string, error) {
 	if len(seedIDs) <= 2 {
 		hops = 3
 	}
-	edges, err := s.QueryGraph(seedIDs, hops)
+	edges, err := s.QueryGraph(seedIDs, hops, libraryID)
 	if err != nil || len(edges) == 0 {
 		return "", nil
 	}
@@ -69,7 +69,7 @@ type GraphTrace struct {
 
 // RetrieveGraphTrace runs the same seed+expand as RetrieveGraph but returns the
 // ids used (for viewer highlight) instead of a text block.
-func (s *Store) RetrieveGraphTrace(emb []float32, k int) *GraphTrace {
+func (s *Store) RetrieveGraphTrace(emb []float32, k int, libraryID string) *GraphTrace {
 	t := &GraphTrace{SeedIDs: []string{}, EdgeIDs: []string{}}
 	if len(emb) == 0 {
 		return t
@@ -77,7 +77,7 @@ func (s *Store) RetrieveGraphTrace(emb []float32, k int) *GraphTrace {
 	if k <= 0 {
 		k = 3
 	}
-	seeds, err := s.EntitySearch(emb, k)
+	seeds, err := s.EntitySearch(emb, k, libraryID)
 	if err != nil || len(seeds) == 0 {
 		return t
 	}
@@ -88,7 +88,7 @@ func (s *Store) RetrieveGraphTrace(emb []float32, k int) *GraphTrace {
 	if len(t.SeedIDs) <= 2 {
 		hops = 3
 	}
-	edges, err := s.QueryGraph(t.SeedIDs, hops)
+	edges, err := s.QueryGraph(t.SeedIDs, hops, libraryID)
 	if err != nil {
 		return t
 	}

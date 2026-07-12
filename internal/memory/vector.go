@@ -1,4 +1,4 @@
-﻿package memory
+package memory
 
 import (
 	"context"
@@ -14,9 +14,12 @@ import (
 
 // memCollection holds conversation memory as embeddings, kept separate from the
 // RAG knowledge-base collections (which live under data/knowledge/chromem).
-// Documents are tagged with metadata.kind = "turn" | "fact" so recall can filter
-// per kind (chromem's filter is equality-AND only — no $or, so each kind is
-// queried separately and merged by the caller).
+// Documents are tagged with metadata.kind = "turn" | "fact" | "entity" and
+// metadata.ws = <libraryID> for per-domain isolation.
+//
+// chromem's filter is equality-AND only (no $or). Per-domain isolation is
+// therefore enforced in Go after retrieval: results whose "ws" matches the
+// target library, OR whose "ws" is empty (legacy pre-isolation data), are kept.
 const memCollection = "mem_longterm"
 
 // VectorStore is the semantic memory layer. It stores pre-computed embeddings
@@ -61,27 +64,38 @@ func (v *VectorStore) AddWithEmbedding(id, content string, embedding []float32, 
 	return v.col.AddDocuments(context.Background(), []chromem.Document{doc}, 1)
 }
 
-// AddTurn stores a user-question turn vector. The assistant reply is carried in
-// metadata so a single question-vector match returns the whole Q&A pair.
-func (v *VectorStore) AddTurn(id, userText, reply, sessionID, itemID string, emb []float32) error {
+// AddTurn stores a user-question turn vector, tagged with its domain library.
+// The assistant reply is carried in metadata so a single question-vector match
+// returns the whole Q&A pair.
+func (v *VectorStore) AddTurn(id, userText, reply, sessionID, itemID, workspaceID string, emb []float32) error {
 	return v.AddWithEmbedding(id, userText, emb, map[string]string{
-		"kind": "turn", "reply": reply, "sessionId": sessionID, "itemId": itemID,
+		"kind": "turn", "reply": reply, "sessionId": sessionID, "itemId": itemID, "ws": workspaceID,
 	})
 }
 
-// AddFact stores an extracted fact vector.
-func (v *VectorStore) AddFact(id, content, category, itemID string, emb []float32) error {
+// AddFact stores an extracted fact vector, tagged with its domain library.
+func (v *VectorStore) AddFact(id, content, category, itemID, workspaceID string, emb []float32) error {
 	return v.AddWithEmbedding(id, content, emb, map[string]string{
-		"kind": "fact", "category": category, "itemId": itemID,
+		"kind": "fact", "category": category, "itemId": itemID, "ws": workspaceID,
 	})
 }
 
 // AddEntity stores a graph-entity vector (kind=entity) so the retriever can
 // seed graph expansion by semantic similarity to the query.
-func (v *VectorStore) AddEntity(nodeID, name, entityType string, emb []float32) error {
+func (v *VectorStore) AddEntity(nodeID, name, entityType, workspaceID string, emb []float32) error {
 	return v.AddWithEmbedding(nodeID, name, emb, map[string]string{
-		"kind": "entity", "type": entityType, "name": name, "itemId": nodeID,
+		"kind": "entity", "type": entityType, "name": name, "itemId": nodeID, "ws": workspaceID,
 	})
+}
+
+// Delete removes documents by ID (orphan cleanup on memory/node deletion).
+func (v *VectorStore) Delete(ids ...string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if len(ids) == 0 {
+		return nil
+	}
+	return v.col.Delete(context.Background(), nil, nil, ids...)
 }
 
 // QueryWithEmbedding returns up to k nearest docs matching the metadata filter.
@@ -99,11 +113,34 @@ func (v *VectorStore) QueryWithEmbedding(embedding []float32, k int, filter map[
 	return v.col.QueryEmbedding(context.Background(), embedding, k, filter, nil)
 }
 
-// QueryTurns returns up to k turn hits (question + associated reply).
-func (v *VectorStore) QueryTurns(emb []float32, k int) ([]TurnHit, error) {
-	res, err := v.QueryWithEmbedding(emb, k, map[string]string{"kind": "turn"})
+// scopeByWorkspace keeps results that belong to the target library, plus any
+// legacy results that carry no "ws" tag (pre-isolation data). This implements
+// per-domain isolation without re-embedding old vectors.
+func scopeByWorkspace(res []chromem.Result, libraryID string) []chromem.Result {
+	if libraryID == "" {
+		return res
+	}
+	out := res[:0]
+	for _, r := range res {
+		ws := r.Metadata["ws"]
+		if ws == libraryID || ws == "" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// QueryTurns returns up to k turn hits scoped to libraryID (legacy data included).
+func (v *VectorStore) QueryTurns(emb []float32, k int, libraryID string) ([]TurnHit, error) {
+	// Fetch a wider candidate set (3x) so post-filtering still yields ~k hits.
+	fetchK := k * 3
+	res, err := v.QueryWithEmbedding(emb, fetchK, map[string]string{"kind": "turn"})
 	if err != nil {
 		return nil, err
+	}
+	res = scopeByWorkspace(res, libraryID)
+	if len(res) > k {
+		res = res[:k]
 	}
 	out := make([]TurnHit, 0, len(res))
 	for _, r := range res {
@@ -112,11 +149,16 @@ func (v *VectorStore) QueryTurns(emb []float32, k int) ([]TurnHit, error) {
 	return out, nil
 }
 
-// QueryFacts returns up to k fact hits.
-func (v *VectorStore) QueryFacts(emb []float32, k int) ([]FactHit, error) {
-	res, err := v.QueryWithEmbedding(emb, k, map[string]string{"kind": "fact"})
+// QueryFacts returns up to k fact hits scoped to libraryID.
+func (v *VectorStore) QueryFacts(emb []float32, k int, libraryID string) ([]FactHit, error) {
+	fetchK := k * 3
+	res, err := v.QueryWithEmbedding(emb, fetchK, map[string]string{"kind": "fact"})
 	if err != nil {
 		return nil, err
+	}
+	res = scopeByWorkspace(res, libraryID)
+	if len(res) > k {
+		res = res[:k]
 	}
 	out := make([]FactHit, 0, len(res))
 	for _, r := range res {
@@ -125,11 +167,16 @@ func (v *VectorStore) QueryFacts(emb []float32, k int) ([]FactHit, error) {
 	return out, nil
 }
 
-// QueryEntities returns up to k entity hits — the vector seeds for graph expansion.
-func (v *VectorStore) QueryEntities(emb []float32, k int) ([]EntityHit, error) {
-	res, err := v.QueryWithEmbedding(emb, k, map[string]string{"kind": "entity"})
+// QueryEntities returns up to k entity hits scoped to libraryID.
+func (v *VectorStore) QueryEntities(emb []float32, k int, libraryID string) ([]EntityHit, error) {
+	fetchK := k * 3
+	res, err := v.QueryWithEmbedding(emb, fetchK, map[string]string{"kind": "entity"})
 	if err != nil {
 		return nil, err
+	}
+	res = scopeByWorkspace(res, libraryID)
+	if len(res) > k {
+		res = res[:k]
 	}
 	out := make([]EntityHit, 0, len(res))
 	for _, r := range res {

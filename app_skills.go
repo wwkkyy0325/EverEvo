@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 
 	"everevo/internal/skills"
@@ -12,15 +13,19 @@ import (
 // ─── Skills 管理 API ────────────────────────────────────────────
 
 // ListSkills returns all skills with their enabled state.
-func (a *App) ListSkills() []skills.Skill {
+// Pass empty libraryId to list all skills (backward-compatible).
+func (a *App) ListSkills(libraryId string) []skills.Skill {
 	if a.skillManager == nil { return []skills.Skill{} }
-	list := a.skillManager.List()
-	log.Printf("[api] ListSkills → %d skills", len(list))
+	list := a.skillManager.ListByLibrary(libraryId)
+	log.Printf("[api] ListSkills(library=%q) → %d skills", libraryId, len(list))
 	return list
 }
 
-// ListEnabledSkills returns only enabled skills.
-func (a *App) ListEnabledSkills() []skills.Skill { return a.skillManager.ListEnabled() }
+// ListEnabledSkills returns only enabled skills, optionally filtered by library.
+func (a *App) ListEnabledSkills(libraryId string) []skills.Skill {
+	if a.skillManager == nil { return []skills.Skill{} }
+	return a.skillManager.ListEnabledByLibrary(libraryId)
+}
 
 // SetSkillEnabled enables or disables a skill and saves.
 func (a *App) SetSkillEnabled(name string, enabled bool) bool {
@@ -34,7 +39,14 @@ func (a *App) SetSkillEnabled(name string, enabled bool) bool {
 }
 
 // CreateSkill creates a new skill from the frontend and saves to disk.
+// LibraryID is required. Skills with empty LibraryID are treated as global.
 func (a *App) CreateSkill(s skills.Skill) error {
+	// Global skills (LibraryID == "") are allowed — they appear in all domains.
+	if s.LibraryID != "" {
+		if err := a.validateLibraryID(s.LibraryID); err != nil {
+			return fmt.Errorf("创建 Skill 失败: %w", err)
+		}
+	}
 	return a.skillManager.Create(s)
 }
 

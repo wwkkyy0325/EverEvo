@@ -43,6 +43,7 @@ func init() {
 		"plugin_install": hPluginInstall,
 		"plugin_delete":  hPluginDelete,
 		"plugin_logs":    hPluginLogs,
+		"plugin_create":  hPluginCreate,
 
 		// ── knowledge base ──
 		"kb_list":         hKBList,
@@ -138,6 +139,7 @@ func init() {
 		// ── shell ──
 		"shell_exec":      hShellExec,
 		"web_search":      hWebSearch,
+		"web_fetch":       hWebFetch,
 
 		// ── download engine ──
 		"download_engine": hDownloadEngine,
@@ -221,7 +223,15 @@ func hPluginList(a *App, _ map[string]any) tools.ToolResult {
 }
 
 func hPluginStatus(a *App, p map[string]any) tools.ToolResult {
-	return tools.OkResult(a.GetPluginStatus(tools.GetString(p, "name")))
+	name := tools.GetString(p, "name")
+	if name != "" {
+		return tools.OkResult(a.GetPluginStatus(name))
+	}
+	// No name → return all plugin statuses (a bare status call shouldn't fail).
+	return tools.OkResult(map[string]any{
+		"all":     a.getPluginHost().ListStatus(),
+		"hint":    "未指定 name，返回所有插件状态",
+	})
 }
 
 func hPluginStart(a *App, p map[string]any) tools.ToolResult {
@@ -244,9 +254,38 @@ func hPluginRun(a *App, p map[string]any) tools.ToolResult {
 	params, _ := p["params"].(map[string]any)
 	out, err := a.RunPlugin(name, method, params)
 	if err != nil {
-		return tools.ErrResult(err)
+		// Attach diagnostics so timeouts aren't a black box: include the
+		// process status + recent stderr (Python tracebacks / startup errors
+		// land here). This is the difference between "请求超时" and knowing
+		// the plugin crashed on import or never read stdin.
+		status := a.GetPluginStatus(name)
+		logs := a.GetPluginLogs(name)
+		diag := map[string]any{
+			"running": status.Running,
+			"pid":     status.PID,
+			"error":   err.Error(),
+		}
+		if status.Error != "" {
+			diag["statusError"] = status.Error
+		}
+		if strings.TrimSpace(logs) != "" {
+			tail := logs
+			if len(tail) > 1500 {
+				tail = "…" + tail[len(tail)-1500:]
+			}
+			diag["stderr"] = tail
+		} else {
+			diag["stderr"] = "(空 — 插件未输出任何日志，可能 Python 启动即崩溃或 stdio 通道断开)"
+		}
+		return tools.ErrResult(fmt.Errorf("插件 %s.%s 调用失败: %w\n诊断: %s", name, method, err, asJSON(diag)))
 	}
 	return tools.OkResult(out)
+}
+
+// asJSON is a tiny helper for embedding structured diagnostics in error text.
+func asJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 func hPluginInstall(a *App, p map[string]any) tools.ToolResult {
@@ -267,6 +306,26 @@ func hPluginDelete(a *App, p map[string]any) tools.ToolResult {
 
 func hPluginLogs(a *App, p map[string]any) tools.ToolResult {
 	return tools.OkResult(map[string]string{"logs": a.GetPluginLogs(tools.GetString(p, "name"))})
+}
+
+func hPluginCreate(a *App, p map[string]any) tools.ToolResult {
+	name := tools.GetString(p, "name")
+	runtime := tools.GetString(p, "runtime")
+	code := tools.GetString(p, "code")
+	desc := tools.GetString(p, "description")
+	methods := tools.GetString(p, "methods")
+	deps := tools.GetString(p, "dependencies")
+	autoStart := true
+	if v, ok := p["autoStart"]; ok {
+		if b, ok := v.(bool); ok {
+			autoStart = b
+		}
+	}
+	result, err := a.PluginCreate(name, runtime, desc, code, methods, deps, autoStart)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
 }
 
 // ─── KB handlers ──────────────────────────────────────────────
@@ -506,6 +565,14 @@ func hGuideSearch(a *App, p map[string]any) tools.ToolResult {
 		}
 		hits = append(hits, guideHit{Guide: g, Snippet: snippet})
 	}
+	if len(hits) == 0 {
+		// Return an explicit empty array + hint instead of null, so the caller
+		// can tell "no matches" apart from "tool produced nothing".
+		return tools.OkResult(map[string]any{
+			"results": []any{},
+			"hint":    "无匹配攻略。攻略可能未同步——先调用 guide_sync 拉取来源。",
+		})
+	}
 	return tools.OkResult(hits)
 }
 
@@ -650,7 +717,9 @@ func hWorkflowStatus(a *App, p map[string]any) tools.ToolResult {
 func hWorkflowValidate(a *App, p map[string]any) tools.ToolResult {
 	id := tools.GetString(p, "id")
 	if id == "" {
-		return tools.ErrMsg("缺少必填参数: id")
+		// No id → validate nothing, return a helpful empty result instead of
+		// an error (a bare validate call shouldn't read as "tool failed").
+		return tools.OkResult(map[string]any{"valid": true, "issues": []string{}, "hint": "未指定 id；传入 workflow id 以校验"})
 	}
 	wf, err := a.workflowManager.Get(id)
 	if err != nil {
@@ -662,7 +731,7 @@ func hWorkflowValidate(a *App, p map[string]any) tools.ToolResult {
 // ─── MCP handlers ────────────────────────────────────────────
 
 func hMCPListServers(a *App, _ map[string]any) tools.ToolResult {
-	return tools.OkResult(a.ListMCPServers())
+	return tools.OkResult(a.ListMCPServers(""))
 }
 func hMCPAddServer(a *App, p map[string]any) tools.ToolResult {
 	cfg := mcpclient.ServerConfig{
@@ -748,6 +817,19 @@ func hWebSearch(a *App, p map[string]any) tools.ToolResult {
 		return tools.ErrResult(err)
 	}
 	return tools.OkResult(results)
+}
+
+func hWebFetch(a *App, p map[string]any) tools.ToolResult {
+	url := tools.GetString(p, "url")
+	if url == "" {
+		return tools.ErrMsg("缺少必填参数: url")
+	}
+	prompt := tools.GetString(p, "prompt")
+	result, err := a.WebFetch(url, prompt)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
 }
 
 // ─── Shell exec handler ──────────────────────────────────────

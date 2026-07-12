@@ -102,7 +102,11 @@ func (s *Store) UpsertNode(nodeType, name, workspaceID string, embed func(string
 	embeddingID := ""
 	if embed != nil {
 		if vec, eErr := embed(name); eErr == nil && len(vec) > 0 {
-			if aErr := s.AddEntity(id, name, nodeType, vec); aErr == nil {
+			ws := workspaceID
+			if ws == "" {
+				ws = "default"
+			}
+			if aErr := s.AddEntity(id, name, nodeType, ws, vec); aErr == nil {
 				embeddingID = id
 			}
 		}
@@ -182,9 +186,18 @@ func (s *Store) AddEdge(srcID, dstID, relType, props, sessionID, crossTags strin
 // QueryGraph expands from the seed nodes up to `hops` away along currently-valid
 // edges (bidirectional), returning the edges among the reachable sub-graph. This
 // is the graph half of LightRAG-style hybrid retrieval.
-func (s *Store) QueryGraph(seedIDs []string, hops int) ([]GraphEdge, error) {
+func (s *Store) QueryGraph(seedIDs []string, hops int, libraryID string) ([]GraphEdge, error) {
 	if len(seedIDs) == 0 || hops <= 0 {
 		return nil, nil
+	}
+	// libraryID scopes the traversal: only edges whose reached endpoint belongs
+	// to the given library (or legacy 'default') are followed, preventing
+	// cross-domain leakage. Empty → global.
+	scopeClause := ""
+	var scopeArgs []any
+	if libraryID != "" {
+		scopeClause = ` AND (n.workspace_id = ? OR n.workspace_id = 'default')`
+		scopeArgs = []any{libraryID}
 	}
 	q := `
 WITH RECURSIVE reach(id, depth) AS (
@@ -192,11 +205,13 @@ WITH RECURSIVE reach(id, depth) AS (
 	UNION
 	SELECT e.dst_id, r.depth + 1 FROM reach r
 		JOIN kg_edges e ON e.src_id = r.id
-		WHERE e.valid_to IS NULL AND r.depth < ?
+		JOIN kg_nodes n ON n.id = e.dst_id
+		WHERE e.valid_to IS NULL AND r.depth < ?` + scopeClause + `
 	UNION
 	SELECT e.src_id, r.depth + 1 FROM reach r
 		JOIN kg_edges e ON e.dst_id = r.id
-		WHERE e.valid_to IS NULL AND r.depth < ?
+		JOIN kg_nodes n ON n.id = e.src_id
+		WHERE e.valid_to IS NULL AND r.depth < ?` + scopeClause + `
 )
 SELECT e.id, e.src_id, e.dst_id, e.type, e.valid_from, COALESCE(e.valid_to, 0), e.recorded_at, e.cross_tags, e.weight,
        sn.name_raw, dn.name_raw
@@ -206,11 +221,14 @@ JOIN (SELECT DISTINCT id FROM reach) rd ON rd.id = e.dst_id
 JOIN kg_nodes sn ON sn.id = e.src_id
 JOIN kg_nodes dn ON dn.id = e.dst_id
 WHERE e.valid_to IS NULL`
-	args := make([]any, 0, len(seedIDs)+2)
+	args := make([]any, 0, len(seedIDs)+2+len(scopeArgs)*2)
 	for _, id := range seedIDs {
 		args = append(args, id)
 	}
-	args = append(args, hops, hops)
+	args = append(args, hops)
+	args = append(args, scopeArgs...)
+	args = append(args, hops)
+	args = append(args, scopeArgs...)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
@@ -243,7 +261,7 @@ func (s *Store) ListNodesByLibrary(libraryID string) ([]GraphNode, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []GraphNode
+	out := make([]GraphNode, 0) // empty slice, not nil — so JSON is [] not null
 	for rows.Next() {
 		var n GraphNode
 		if err := rows.Scan(&n.ID, &n.Type, &n.Name, &n.CreatedAt); err != nil {
@@ -321,9 +339,8 @@ func (s *Store) ListAllEdgesIncludeHistoryByLibrary(libraryID string) ([]GraphEd
 	return out, rows.Err()
 }
 
-// DeleteNode removes a node and cascades its edges. The entity's chromem doc is
-// left in place (harmless orphan — EntitySearch may still return the id, but
-// QueryGraph joins kg_nodes and won't find the deleted node, so it yields nothing).
+// DeleteNode removes a node, cascades its edges, and deletes the entity's
+// chromem doc so EntitySearch no longer returns a dead seed.
 func (s *Store) DeleteNode(id string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -337,7 +354,13 @@ func (s *Store) DeleteNode(id string) error {
 		_ = tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if s.vector != nil {
+		_ = s.vector.Delete(id) // best-effort orphan cleanup
+	}
+	return nil
 }
 
 // DeleteEdge removes a single edge.

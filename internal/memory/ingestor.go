@@ -62,7 +62,7 @@ func (s *Store) IngestGraph(entities []ExtractedEntity, relations []ExtractedRel
 		// creating a near-duplicate node (e.g. 用户/User/我 collapse to one).
 		if embed != nil {
 			if vec, eErr := embed(name); eErr == nil && len(vec) > 0 {
-				if hits, _ := s.EntitySearch(vec, 1); len(hits) > 0 && hits[0].Similarity >= 0.92 {
+				if hits, _ := s.EntitySearch(vec, 1, workspaceID); len(hits) > 0 && hits[0].Similarity >= 0.92 {
 					nameToID[norm] = hits[0].ID
 					return hits[0].ID, true
 				}

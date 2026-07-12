@@ -435,6 +435,31 @@ func (s *Store) ListKBs(libraryID string) []*KnowledgeBase {
 	return list
 }
 
+// BackfillLibraryIDs sets LibraryID on all KBs that don't have one (or have
+// an invalid/dangling one). Called at startup. validIDs is the set of current
+// domain library IDs from the memory store.
+func (s *Store) BackfillLibraryIDs(defaultLibraryID string, validIDs []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	valid := make(map[string]bool, len(validIDs))
+	for _, id := range validIDs {
+		valid[id] = true
+	}
+	changed := false
+	for _, kb := range s.meta {
+		if kb.LibraryID == "" || !valid[kb.LibraryID] {
+			if kb.LibraryID != "" {
+				log.Printf("[rag] KB %q 的 libraryId %q 无效，回填为默认领域", kb.Name, kb.LibraryID)
+			}
+			kb.LibraryID = defaultLibraryID
+			changed = true
+		}
+	}
+	if changed {
+		s.saveMetaLocked()
+	}
+}
+
 // DeleteCollection removes a collection, its KB metadata, and its doc manifest.
 func (s *Store) DeleteCollection(name string) error {
 	if err := s.db.DeleteCollection(name); err != nil {

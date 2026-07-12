@@ -14,6 +14,8 @@ const (
 	NodeLoop      NodeType = "loop"
 	NodeAgent     NodeType = "agent"
 	NodeOutput    NodeType = "output"
+	NodeParallel  NodeType = "parallel" // concurrent branches, gather all
+	NodeMap       NodeType = "map"      // concurrent map over an array
 )
 
 // ExecutionStatus tracks the overall workflow execution state.

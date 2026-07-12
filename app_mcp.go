@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 
 	"everevo/internal/config"
@@ -45,13 +46,17 @@ func (a *App) GetMCPStatus() mcp.Status {
 // ─── MCP Client 管理 API ─────────────────────────────────────────
 
 // ListMCPServers returns all configured external MCP servers.
-func (a *App) ListMCPServers() []mcpclient.ServerConfig {
+// Pass empty libraryId to list all servers (backward-compatible).
+func (a *App) ListMCPServers(libraryId string) []mcpclient.ServerConfig {
 	if a.mcpClient == nil { return []mcpclient.ServerConfig{} }
-	return a.mcpClient.ListServers()
+	return a.mcpClient.ListServersByLibrary(libraryId)
 }
 
-// AddMCPServer adds and persists a new MCP server config.
+// AddMCPServer adds and persists a new MCP server config. LibraryID is required.
 func (a *App) AddMCPServer(cfg mcpclient.ServerConfig) error {
+	if err := a.validateLibraryID(cfg.LibraryID); err != nil {
+		return fmt.Errorf("添加 MCP Server 失败: %w", err)
+	}
 	if err := a.mcpClient.AddServer(cfg); err != nil {
 		return err
 	}

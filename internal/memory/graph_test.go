@@ -86,7 +86,7 @@ func TestQueryGraphHops(t *testing.T) {
 	_ = s.AddEdge(b, c, "knows", "{}", "", "[]", false)
 
 	// 1 hop from A reaches {A, B} → only the A–B edge has both ends in reach.
-	edges1, err := s.QueryGraph([]string{a}, 1)
+	edges1, err := s.QueryGraph([]string{a}, 1, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestQueryGraphHops(t *testing.T) {
 		t.Errorf("1-hop from A: want 1 edge, got %d (%v)", len(edges1), edges1)
 	}
 	// 2 hops reaches {A, B, C} → A–B and B–C.
-	edges2, err := s.QueryGraph([]string{a}, 2)
+	edges2, err := s.QueryGraph([]string{a}, 2, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestQueryGraphHops(t *testing.T) {
 		t.Errorf("2-hop from A: want 2 edges, got %d (%v)", len(edges2), edges2)
 	}
 	// 0 hops → nothing.
-	if edges0, _ := s.QueryGraph([]string{a}, 0); len(edges0) != 0 {
+	if edges0, _ := s.QueryGraph([]string{a}, 0, ""); len(edges0) != 0 {
 		t.Errorf("0-hop: want 0 edges, got %d", len(edges0))
 	}
 }

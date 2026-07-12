@@ -3,9 +3,13 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 
+	"everevo/internal/memory"
+	"everevo/internal/taskboard"
 	"everevo/internal/tools"
 )
 
@@ -40,6 +44,48 @@ func init() {
 	toolHandlers["library_delete"] = hLibraryDelete2
 	toolHandlers["write_file"] = hWriteFile
 	toolHandlers["list_directory"] = hListDirectory
+
+	toolHandlers["zone_list"] = hZoneList
+	toolHandlers["zone_create_experiment"] = hZoneCreateExperiment
+	toolHandlers["zone_launch"] = hZoneLaunch
+	toolHandlers["zone_stop"] = hZoneStop
+	toolHandlers["zone_merge"] = hZoneMerge
+	toolHandlers["zone_discard"] = hZoneDiscard
+	toolHandlers["backup_list"] = hBackupList
+	toolHandlers["backup_create"] = hBackupCreate
+	toolHandlers["backup_restore"] = hBackupRestore
+	toolHandlers["evolve_capability"] = hEvolveCapability
+	toolHandlers["evolve_build"] = hEvolveBuild
+	toolHandlers["evolve_swap"] = hEvolveSwap
+	toolHandlers["evolve_tasks"] = hEvolveTasks
+	toolHandlers["ingest_folder"] = hIngestFolder
+	toolHandlers["ingest_analyze"] = hIngestAnalyze
+	toolHandlers["ingest_commit"] = hIngestCommit
+	toolHandlers["ingest_cancel"] = hIngestCancel
+	toolHandlers["ingest_deep"] = hIngestDeep
+	toolHandlers["ingest_deep_analyze"] = hIngestDeepAnalyze
+	toolHandlers["ingest_deep_commit"] = hIngestDeepCommit
+	toolHandlers["ingest_deep_review"] = hIngestDeepReview
+
+	toolHandlers["collab_create"] = hCollabCreate
+	toolHandlers["collab_dispatch"] = hCollabDispatch
+	toolHandlers["collab_dispatch_async"] = hCollabDispatchAsync
+	toolHandlers["collab_wait"] = hCollabWait
+	toolHandlers["blackboard_set"] = hBlackboardSet
+	toolHandlers["blackboard_get"] = hBlackboardGet
+	toolHandlers["blackboard_list"] = hBlackboardList
+	toolHandlers["agent_message"] = hAgentMessage
+	toolHandlers["collab_list_sessions"] = hCollabListSessions
+	toolHandlers["collab_complete"] = hCollabComplete
+
+	toolHandlers["plan_create"] = hPlanCreate
+	toolHandlers["plan_step_update"] = hPlanStepUpdate
+	toolHandlers["plan_list"] = hPlanList
+
+	toolHandlers["taskboard_list"] = hTaskBoardList
+	toolHandlers["taskboard_add"] = hTaskBoardAdd
+	toolHandlers["taskboard_update"] = hTaskBoardUpdate
+	toolHandlers["taskboard_steps"] = hTaskBoardSteps
 }
 
 // ── Memory ──
@@ -47,7 +93,8 @@ func init() {
 func hMemoryList(a *App, p map[string]any) tools.ToolResult {
 	limit := tools.GetInt(p, "limit")
 	if limit <= 0 { limit = 20 }
-	list, err := a.MemoryList(limit)
+	libID := tools.GetString(p, "libraryId")
+	list, err := a.MemoryList(limit, libID)
 	if err != nil { return tools.ErrResult(err) }
 	return tools.OkResult(list)
 }
@@ -55,8 +102,9 @@ func hMemoryList(a *App, p map[string]any) tools.ToolResult {
 func hMemorySearch(a *App, p map[string]any) tools.ToolResult {
 	query := tools.GetString(p, "query")
 	k := tools.GetInt(p, "k")
+	libID := tools.GetString(p, "libraryId")
 	if k <= 0 { k = 5 }
-	result, err := a.MemoryRecall(query, k)
+	result, err := a.MemoryRecallScoped(query, k, libID)
 	if err != nil { return tools.ErrResult(err) }
 	return tools.OkResult(result)
 }
@@ -84,7 +132,8 @@ func hMemoryClear(a *App, p map[string]any) tools.ToolResult {
 // ── Core Facts ──
 
 func hCoreList(a *App, p map[string]any) tools.ToolResult {
-	facts, err := a.MemoryCoreList()
+	libID := tools.GetString(p, "libraryId")
+	facts, err := a.MemoryCoreListByLibrary(libID)
 	if err != nil { return tools.ErrResult(err) }
 	return tools.OkResult(facts)
 }
@@ -125,16 +174,22 @@ func hSessionDelete(a *App, p map[string]any) tools.ToolResult {
 
 func hGraphList(a *App, p map[string]any) tools.ToolResult {
 	search := tools.GetString(p, "search")
-	libID, _ := a.memoryStore.DefaultLibrary()
+	// Honor caller-provided libraryId (e.g. from an agent's bound domain);
+	// fall back to the default library for standalone calls.
+	libID := tools.GetString(p, "libraryId")
+	if libID == "" {
+		libID, _ = a.memoryStore.DefaultLibrary()
+	}
 	result, err := a.MemoryGraphList(false, libID)
 	if err != nil { return tools.ErrResult(err) }
-	nodes, _ := result["nodes"].([]any)
+	// MemoryGraphList returns nodes as []memory.GraphNode, not []any — asserting
+	// to []any always fails (Go forbids the conversion), yielding nil → JSON null.
+	nodes, _ := result["nodes"].([]memory.GraphNode)
 	if search != "" {
-		var filtered []any
+		filtered := make([]memory.GraphNode, 0, len(nodes))
 		for _, n := range nodes {
-			if nm, ok := n.(map[string]any); ok {
-				name, _ := nm["name"].(string)
-				if contains(name, search) { filtered = append(filtered, n) }
+			if contains(n.Name, search) {
+				filtered = append(filtered, n)
 			}
 		}
 		nodes = filtered
@@ -171,7 +226,10 @@ func hGraphRenameNode(a *App, p map[string]any) tools.ToolResult {
 // ── Wiki ──
 
 func hWikiList(a *App, p map[string]any) tools.ToolResult {
-	libID, _ := a.memoryStore.DefaultLibrary()
+	libID := tools.GetString(p, "libraryId")
+	if libID == "" {
+		libID, _ = a.memoryStore.DefaultLibrary()
+	}
 	pages, err := a.WikiListPages(libID)
 	if err != nil { return tools.ErrResult(err) }
 	return tools.OkResult(pages)
@@ -226,7 +284,10 @@ func hWikiReindex(a *App, p map[string]any) tools.ToolResult {
 func hExperienceList(a *App, p map[string]any) tools.ToolResult {
 	limit := tools.GetInt(p, "limit")
 	if limit <= 0 { limit = 10 }
-	libID, _ := a.memoryStore.DefaultLibrary()
+	libID := tools.GetString(p, "libraryId")
+	if libID == "" {
+		libID, _ = a.memoryStore.DefaultLibrary()
+	}
 	items, err := a.MemoryRecallExperience(libID, limit)
 	if err != nil { return tools.ErrResult(err) }
 	return tools.OkResult(items)
@@ -251,7 +312,7 @@ func hLibraryCreate2(a *App, p map[string]any) tools.ToolResult {
 	name := tools.GetString(p, "name")
 	desc := tools.GetString(p, "description")
 	if name == "" { return tools.ErrMsg("name required") }
-	id, err := a.LibraryCreate(name, desc, false)
+	id, err := a.LibraryCreate(name, desc, "", false)
 	if err != nil { return tools.ErrResult(err) }
 	return tools.OkResult(map[string]string{"id": id, "name": name})
 }
@@ -287,6 +348,294 @@ func hListDirectory(a *App, p map[string]any) tools.ToolResult {
 	return tools.OkResult(map[string]any{"entries": out})
 }
 
+// ─── Zone management handlers ──────────────────────────────────────
+
+func hZoneList(a *App, _ map[string]any) tools.ToolResult {
+	zones, err := a.ListZones()
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	type zoneInfo struct {
+		Name      string `json:"name"`
+		Type      string `json:"type"`
+		Parent    string `json:"parent"`
+		PID       int    `json:"pid"`
+		MCPPort   int    `json:"mcpPort"`
+		A2APort   int    `json:"a2aPort"`
+		CreatedAt string `json:"createdAt"`
+	}
+	var out []zoneInfo
+	for _, z := range zones {
+		out = append(out, zoneInfo{
+			Name:      z.Name,
+			Type:      string(z.Type),
+			Parent:    z.Parent,
+			PID:       z.PID,
+			MCPPort:   z.MCPPort,
+			A2APort:   z.A2APort,
+			CreatedAt: z.CreatedAt.Format("2006-01-02 15:04:05"),
+		})
+	}
+	return tools.OkResult(out)
+}
+
+func hZoneCreateExperiment(a *App, p map[string]any) tools.ToolResult {
+	name := tools.GetString(p, "name")
+	if name == "" {
+		return tools.ErrMsg("实验区名称不能为空")
+	}
+	z, err := a.CreateExperiment(name)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(map[string]any{
+		"name":    z.Name,
+		"type":    string(z.Type),
+		"dir":     z.Dir,
+		"message": "实验区已创建，使用 zone_launch(\"" + z.Name + "\") 启动",
+	})
+}
+
+func hZoneLaunch(a *App, p map[string]any) tools.ToolResult {
+	name := tools.GetString(p, "name")
+	if name == "" {
+		return tools.ErrMsg("运行区名称不能为空")
+	}
+	if err := a.LaunchZone(name); err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(map[string]any{
+		"message": "运行区 " + name + " 已启动（新窗口）",
+	})
+}
+
+func hZoneStop(a *App, p map[string]any) tools.ToolResult {
+	name := tools.GetString(p, "name")
+	if name == "" {
+		return tools.ErrMsg("运行区名称不能为空")
+	}
+	if err := a.StopZone(name); err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(map[string]any{
+		"message": "运行区 " + name + " 已停止",
+	})
+}
+
+func hZoneMerge(a *App, p map[string]any) tools.ToolResult {
+	name := tools.GetString(p, "name")
+	if name == "" {
+		return tools.ErrMsg("实验区名称不能为空")
+	}
+	if err := a.MergeZone(name); err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(map[string]any{
+		"message": "实验区 " + name + " 已合并到生产区（备份已自动创建）。建议手动重启生产实例使配置生效。",
+	})
+}
+
+func hZoneDiscard(a *App, p map[string]any) tools.ToolResult {
+	name := tools.GetString(p, "name")
+	if name == "" {
+		return tools.ErrMsg("运行区名称不能为空")
+	}
+	if err := a.DiscardZone(name); err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(map[string]any{
+		"message": "运行区 " + name + " 已删除",
+	})
+}
+
+func hBackupList(a *App, _ map[string]any) tools.ToolResult {
+	backups, err := a.ListBackups()
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	type backupInfo struct {
+		Name      string `json:"name"`
+		CreatedAt string `json:"createdAt"`
+	}
+	var out []backupInfo
+	for _, b := range backups {
+		out = append(out, backupInfo{
+			Name:      b.Name,
+			CreatedAt: b.CreatedAt.Format("2006-01-02 15:04:05"),
+		})
+	}
+	return tools.OkResult(out)
+}
+
+func hBackupCreate(a *App, _ map[string]any) tools.ToolResult {
+	b, err := a.CreateBackup()
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(map[string]any{
+		"name":    b.Name,
+		"message": "备份已创建: " + b.Name,
+	})
+}
+
+func hBackupRestore(a *App, p map[string]any) tools.ToolResult {
+	name := tools.GetString(p, "name")
+	if name == "" {
+		return tools.ErrMsg("备份名称不能为空")
+	}
+	if err := a.RestoreBackup(name); err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(map[string]any{
+		"message": "已从备份 " + name + " 恢复。建议重启生产实例。",
+	})
+}
+
+// ─── Self-evolution handlers ───────────────────────────────────────
+
+func hEvolveCapability(a *App, _ map[string]any) tools.ToolResult {
+	c := a.GetEvolveCapability()
+	return tools.OkResult(map[string]any{
+		"sourceAvailable": c.SourceAvailable,
+		"sourceDir":       c.SourceDir,
+		"buildOutput":     c.BuildOutput,
+		"currentExe":      c.CurrentExe,
+		"goAvailable":     c.GoAvailable,
+		"nodeAvailable":   c.NodeAvailable,
+		"wailsAvailable":  c.WailsAvailable,
+	})
+}
+
+func hEvolveBuild(a *App, _ map[string]any) tools.ToolResult {
+	result, err := a.BuildSelf()
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
+}
+
+func hEvolveSwap(a *App, _ map[string]any) tools.ToolResult {
+	if err := a.SwapAndRestart(); err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(map[string]any{
+		"message": "正在重启...程序即将退出并以新版本重新启动",
+	})
+}
+
+func hEvolveTasks(a *App, _ map[string]any) tools.ToolResult {
+	return tools.OkResult(a.ListEvolveTasks())
+}
+
+func hIngestFolder(a *App, p map[string]any) tools.ToolResult {
+	path := tools.GetString(p, "path")
+	if path == "" {
+		return tools.ErrMsg("path 不能为空")
+	}
+	result, err := a.IngestFolder(path)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
+}
+
+func hIngestAnalyze(a *App, p map[string]any) tools.ToolResult {
+	path := tools.GetString(p, "path")
+	if path == "" {
+		return tools.ErrMsg("path 不能为空")
+	}
+	result, err := a.IngestAnalyze(path)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
+}
+
+func hIngestCommit(a *App, p map[string]any) tools.ToolResult {
+	// The "analysis" param comes in as a raw JSON object from the LLM.
+	raw, ok := p["analysis"]
+	if !ok {
+		return tools.ErrMsg("analysis 参数不能为空（请传入 ingest_analyze 返回的完整结果）")
+	}
+	// Re-serialize to JSON then parse into IngestAnalysis.
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return tools.ErrResult(fmt.Errorf("序列化 analysis 失败: %w", err))
+	}
+	var analysis IngestAnalysis
+	if err := json.Unmarshal(data, &analysis); err != nil {
+		return tools.ErrResult(fmt.Errorf("解析 analysis 失败: %w", err))
+	}
+	result, err := a.IngestCommit(&analysis)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
+}
+
+func hIngestDeep(a *App, p map[string]any) tools.ToolResult {
+	path := tools.GetString(p, "path")
+	if path == "" {
+		return tools.ErrMsg("path 不能为空")
+	}
+	result, err := a.IngestDeep(path)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
+}
+
+func hIngestDeepAnalyze(a *App, p map[string]any) tools.ToolResult {
+	path := tools.GetString(p, "path")
+	if path == "" {
+		return tools.ErrMsg("path 不能为空")
+	}
+	result, err := a.IngestDeepAnalyze(path)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
+}
+
+func hIngestDeepCommit(a *App, p map[string]any) tools.ToolResult {
+	raw, ok := p["analysis"]
+	if !ok {
+		return tools.ErrMsg("analysis 参数不能为空")
+	}
+	data, _ := json.Marshal(raw)
+	var analysis DeepAnalysis
+	if err := json.Unmarshal(data, &analysis); err != nil {
+		return tools.ErrResult(fmt.Errorf("解析 analysis: %w", err))
+	}
+	result, err := a.IngestDeepCommit(&analysis)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
+}
+
+func hIngestDeepReview(a *App, p map[string]any) tools.ToolResult {
+	raw, ok := p["analysis"]
+	if !ok {
+		return tools.ErrMsg("analysis 参数不能为空")
+	}
+	data, _ := json.Marshal(raw)
+	var analysis DeepAnalysis
+	if err := json.Unmarshal(data, &analysis); err != nil {
+		return tools.ErrResult(fmt.Errorf("解析 analysis: %w", err))
+	}
+	result, err := a.IngestDeepReview(&analysis)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
+}
+
+func hIngestCancel(a *App, _ map[string]any) tools.ToolResult {
+	a.CancelIngest()
+	return tools.OkResult(map[string]any{"message": "已取消"})
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (s == sub || len(sub) > 0 && findSub(s, sub))
 }
@@ -295,4 +644,76 @@ func findSub(s, sub string) bool {
 		if s[i:i+len(sub)] == sub { return true }
 	}
 	return false
+}
+
+// ─── Task Board handlers ───────────────────────────────────────────
+
+func hTaskBoardList(a *App, _ map[string]any) tools.ToolResult {
+	tasks := a.ListTasks()
+	return tools.OkResult(tasks)
+}
+
+func hTaskBoardAdd(a *App, p map[string]any) tools.ToolResult {
+	title := tools.GetString(p, "title")
+	priority := tools.GetString(p, "priority")
+	if title == "" || priority == "" {
+		return tools.ErrMsg("title and priority required")
+	}
+	desc := tools.GetString(p, "description")
+
+	// Parse steps — each step is either a string or {text, done}
+	stepStrs := tools.GetStringSlice(p, "steps")
+	var steps []taskboard.Step
+	if rawSteps, ok := p["steps"].([]any); ok {
+		for _, s := range rawSteps {
+			switch v := s.(type) {
+			case string:
+				steps = append(steps, taskboard.Step{Text: v})
+			case map[string]any:
+				txt, _ := v["text"].(string)
+				done, _ := v["done"].(bool)
+				if txt != "" {
+					steps = append(steps, taskboard.Step{Text: txt, Done: done})
+				}
+			}
+		}
+	}
+	_ = stepStrs // consumed by raw path above
+
+	deps := tools.GetStringSlice(p, "dependsOn")
+
+	result := a.AddTask(title, desc, priority, steps, deps)
+	return tools.OkResult(result)
+}
+
+func hTaskBoardUpdate(a *App, p map[string]any) tools.ToolResult {
+	id := tools.GetString(p, "id")
+	status := tools.GetString(p, "status")
+	if id == "" || status == "" {
+		return tools.ErrMsg("id and status required")
+	}
+	progress := tools.GetInt(p, "progress")
+	notes := tools.GetString(p, "notes")
+
+	result := a.UpdateTaskStatus(id, status, progress, notes)
+	return tools.OkResult(result)
+}
+
+func hTaskBoardSteps(a *App, p map[string]any) tools.ToolResult {
+	id := tools.GetString(p, "id")
+	if id == "" {
+		return tools.ErrMsg("id required")
+	}
+	var steps []taskboard.Step
+	if raw, ok := p["steps"].([]any); ok {
+		for _, s := range raw {
+			if m, ok := s.(map[string]any); ok {
+				txt, _ := m["text"].(string)
+				done, _ := m["done"].(bool)
+				steps = append(steps, taskboard.Step{Text: txt, Done: done})
+			}
+		}
+	}
+	result := a.UpdateTaskSteps(id, steps)
+	return tools.OkResult(result)
 }

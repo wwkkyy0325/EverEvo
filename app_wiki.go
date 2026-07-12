@@ -24,16 +24,12 @@ func (a *App) getWikiStore(libraryID string) *wiki.Store {
 	if libraryID == "" {
 		return nil
 	}
-	a.wikiStoreMu.RLock()
-	ws, ok := a.wikiStores[libraryID]
-	a.wikiStoreMu.RUnlock()
-	if ok {
-		return ws
-	}
 	a.wikiStoreMu.Lock()
 	defer a.wikiStoreMu.Unlock()
-	// Double-check after acquiring write lock.
-	if ws, ok = a.wikiStores[libraryID]; ok {
+	if a.wikiStores == nil {
+		a.wikiStores = make(map[string]*wiki.Store)
+	}
+	if ws, ok := a.wikiStores[libraryID]; ok {
 		return ws
 	}
 	ws, err := wiki.NewStore(libraryID)

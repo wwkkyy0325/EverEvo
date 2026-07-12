@@ -1,0 +1,25 @@
+package tools
+
+func registerZoneTools() {
+	Register(&ToolDef{Name: "zone_list", Category: "system", Description: "列出所有运行区", Annotations: &ToolAnnotations{ReadOnlyHint: true}, Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{}}})
+	Register(&ToolDef{Name: "zone_create_experiment", Category: "system", Description: "从生产区复制创建实验区", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"name": {Type: "string"}}, Required: []string{"name"}}})
+	Register(&ToolDef{Name: "zone_launch", Category: "system", Description: "启动指定运行区", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"name": {Type: "string"}}, Required: []string{"name"}}})
+	Register(&ToolDef{Name: "zone_stop", Category: "system", Description: "停止指定运行区", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"name": {Type: "string"}}, Required: []string{"name"}}})
+	Register(&ToolDef{Name: "zone_merge", Category: "system", Description: "合并实验区到生产区", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"name": {Type: "string"}}, Required: []string{"name"}}})
+	Register(&ToolDef{Name: "zone_discard", Category: "system", Description: "丢弃实验区", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"name": {Type: "string"}}, Required: []string{"name"}}})
+	Register(&ToolDef{Name: "backup_list", Category: "system", Description: "列出所有备份", Annotations: &ToolAnnotations{ReadOnlyHint: true}, Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{}}})
+	Register(&ToolDef{Name: "backup_create", Category: "system", Description: "手动创建备份", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{}}})
+	Register(&ToolDef{Name: "backup_restore", Category: "system", Description: "从备份恢复", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"name": {Type: "string"}}, Required: []string{"name"}}})
+	Register(&ToolDef{Name: "evolve_capability", Category: "system", Description: "检测自进化能力", Annotations: &ToolAnnotations{ReadOnlyHint: true}, Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{}}})
+	Register(&ToolDef{Name: "evolve_build", Category: "system", Description: "重新编译整个项目", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{}}})
+	Register(&ToolDef{Name: "evolve_swap", Category: "system", Description: "替换 EXE 并重启", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{}}})
+	Register(&ToolDef{Name: "evolve_tasks", Category: "system", Description: "列出进化任务（构建/替换历史）", Annotations: &ToolAnnotations{ReadOnlyHint: true}, Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{}}})
+	Register(&ToolDef{Name: "ingest_folder", Category: "kb", Description: "导入文件夹（快速版）：扫描→分块→嵌入→分类→建 Agent", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"path": {Type: "string"}}, Required: []string{"path"}}})
+	Register(&ToolDef{Name: "ingest_analyze", Category: "kb", Description: "分析文件夹（预览）：扫描→摘要→分类→返回方案，不执行存储", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"path": {Type: "string"}}, Required: []string{"path"}}})
+	Register(&ToolDef{Name: "ingest_commit", Category: "kb", Description: "执行导入计划：建 KB→分块→嵌入→建 Agent", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"analysis": {Type: "object"}}, Required: []string{"analysis"}}})
+	Register(&ToolDef{Name: "ingest_cancel", Category: "kb", Description: "取消正在进行的导入", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{}}})
+	Register(&ToolDef{Name: "ingest_deep", Category: "kb", Description: "深度导入文件夹（推荐）：LLM 逐文件深读→提取结构化元数据→综合设计领域架构→建 KB 和 Agent→后置审查。比快速版慢但质量高很多", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"path": {Type: "string"}}, Required: []string{"path"}}})
+	Register(&ToolDef{Name: "ingest_deep_analyze", Category: "kb", Description: "深度分析（前置）：LLM 逐个文件深读，提取主题/实体/依赖/重要性/领域建议，然后综合设计领域架构。耗时但精准", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"path": {Type: "string"}}, Required: []string{"path"}}})
+	Register(&ToolDef{Name: "ingest_deep_commit", Category: "kb", Description: "执行深度导入计划：按 LLM 设计的架构建 KB→嵌入→建 Agent", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"analysis": {Type: "object"}}, Required: []string{"analysis"}}})
+	Register(&ToolDef{Name: "ingest_deep_review", Category: "kb", Description: "后置审查：LLM 检查导入质量，生成 FAQ，标注噪音文件和知识缺口", Parameters: &ToolParams{Type: "object", Properties: map[string]ToolProp{"analysis": {Type: "object"}}, Required: []string{"analysis"}}})
+}

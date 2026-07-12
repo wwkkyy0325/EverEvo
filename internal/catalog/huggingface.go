@@ -19,6 +19,9 @@ func (h *HuggingFace) Search(query string, limit int, filter *SearchFilter) (*Se
 	if limit <= 0 {
 		limit = 20
 	}
+	if filter == nil {
+		filter = &SearchFilter{}
+	}
 	url := fmt.Sprintf("%s/models?limit=%d&full=false", hfAPI, limit)
 	if filter.Sort != "" {
 		url += "&sort=" + filter.Sort + "&direction=-1"

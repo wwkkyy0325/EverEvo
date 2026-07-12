@@ -15,7 +15,8 @@ type Engine struct {
 	execState   *ExecutionState
 	ctx         context.Context
 	cancel      context.CancelFunc
-	nodeOutputs map[string]any       // accumulated outputs keyed by node ID
+	nodeOutputs    map[string]any       // accumulated outputs keyed by node ID
+	outputsMu      sync.RWMutex          // guards nodeOutputs for parallel node access
 	inputs      map[string]any       // exec inputs from Run() (actual values for input nodes)
 	topoOrder   []string             // topological sort result
 	skipped     map[string]bool      // nodes to skip (from condition branching)
@@ -67,6 +68,31 @@ func NewEngine(wf *WorkflowDef, llm LLMCaller, tool ToolCaller, toolProv ToolPro
 		emitter:      emitter,
 		tracker:      tracker,
 	}
+}
+
+// workflowBlockedTools are tools a workflow Tool node may NEVER call. They are
+// the orchestration + destructive tools that could cause unbounded recursion,
+// self-modification, or system damage. This mirrors the agent-side
+// isOrchestrationTool guard but is enforced at the workflow engine boundary.
+var workflowBlockedTools = map[string]bool{
+	// orchestration (recursion / re-entry)
+	"workflow_execute": true, "workflow_create": true, "workflow_update": true, "workflow_delete": true,
+	"agent_run": true, "agent_create": true, "agent_delegate_to_domain": true, "agent_delegate_multi_domain": true,
+	"agent_synthesize_tool": true,
+	"collab_create": true, "collab_dispatch": true, "collab_dispatch_async": true, "collab_wait": true,
+	"agent_message": true,
+	// destructive system tools
+	"shell_exec": true,
+	"evolve_swap": true, "evolve_build": true,
+	"zone_merge": true, "zone_discard": true,
+	"backup_restore": true, "backup_delete": true,
+	"plugin_create": true, "plugin_delete": true,
+}
+
+// isWorkflowBlockedTool reports whether a workflow Tool node is forbidden from
+// calling the named tool.
+func isWorkflowBlockedTool(name string) bool {
+	return workflowBlockedTools[name]
 }
 
 // SetAgentRunner wires the local-agent runner used by the "agent" node type.
@@ -373,6 +399,41 @@ func (eng *Engine) State() *ExecutionState { return eng.execState }
 
 // Ctx returns the execution context (for cancellation propagation).
 func (eng *Engine) Ctx() context.Context { return eng.ctx }
+
+// SnapshotOutputs returns a shallow copy of nodeOutputs under the read lock.
+// Used by parallel/map nodes to give each concurrent branch an isolated view.
+func (eng *Engine) SnapshotOutputs() map[string]any {
+	eng.outputsMu.RLock()
+	defer eng.outputsMu.RUnlock()
+	out := make(map[string]any, len(eng.nodeOutputs))
+	for k, v := range eng.nodeOutputs {
+		out[k] = v
+	}
+	return out
+}
+
+// WithOutputs swaps nodeOutputs to the given map for the duration of fn, then
+// restores the original. Lets a parallel branch execute sub-nodes against an
+// isolated view without races.
+func (eng *Engine) WithOutputs(view map[string]any, fn func()) {
+	eng.outputsMu.Lock()
+	orig := eng.nodeOutputs
+	eng.nodeOutputs = view
+	eng.outputsMu.Unlock()
+	defer func() {
+		eng.outputsMu.Lock()
+		eng.nodeOutputs = orig
+		eng.outputsMu.Unlock()
+	}()
+	fn()
+}
+
+// SetOutput writes a single key into nodeOutputs under the write lock.
+func (eng *Engine) SetOutput(key string, value any) {
+	eng.outputsMu.Lock()
+	eng.nodeOutputs[key] = value
+	eng.outputsMu.Unlock()
+}
 
 // Validate checks the workflow for common problems.
 func Validate(wf *WorkflowDef) map[string]any {

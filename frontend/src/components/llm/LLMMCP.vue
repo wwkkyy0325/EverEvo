@@ -78,12 +78,19 @@
       </div>
 
       <!-- Connected server list -->
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+        <h4 style="margin:0;">外部 MCP Server</h4>
+        <label style="font-size:11px;color:var(--text-tertiary);cursor:pointer;display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" v-model="showAllDomains" style="cursor:pointer;" />
+          显示全部领域
+        </label>
+      </div>
       <div class="mcpsrv-list" v-if="mcpServers.length">
         <div v-for="srv in mcpServers" :key="srv.id" class="glass-panel mcpsrv-card">
           <div class="mcpsrv-card-left">
             <span class="be-dot" :class="srv.status === 'connected' ? 'dot-live' : (srv.status === 'error' ? 'dot-dead' : 'dot-off')"></span>
             <div class="mcpsrv-info">
-              <div class="mcpsrv-name">{{ srv.name }}</div>
+              <div class="mcpsrv-name">{{ srv.name }} <span v-if="srv.libraryId && libName(srv.libraryId)" class="domain-tag">&#x1F4DA; {{ libName(srv.libraryId) }}</span></div>
               <div class="mcpsrv-meta">
                 <span class="mcpsrv-status-tag" :class="'st-' + srv.status">{{ statusLabel(srv.status) }}</span>
                 <span v-if="srv.toolCount" class="mcpsrv-toolcount">{{ srv.toolCount }} &#24037;&#20855;</span>
@@ -167,11 +174,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useToast } from '../../composables/useToast'
 import { useDataChanged } from '../../composables/useDataChanged'
+import { useActiveLibrary } from '../../composables/useActiveLibrary'
 import { mcpApi, type MCPServer } from '../../api/mcp'
 import { systemApi } from '../../api/system'
+import { memoryApi } from '../../api/memory'
 
 // ── Toast ──
 const toast = useToast()
@@ -180,13 +189,25 @@ function t(type: string, title: string, desc?: string) {
   try { toast.show(type as any, title, desc || '') } catch (_) {}
 }
 
+// ── Domain ──
+const { activeLibraryId } = useActiveLibrary()
+const showAllDomains = ref(false)
+const domainLibs = ref<{ id: string; name: string }[]>([])
+function libName(id: string) { return domainLibs.value.find(l => l.id === id)?.name || '' }
+
 // ── State ──
 const mcpOk = ref(false)
 const mcpUrl = ref('')
 const mcpPort = ref(19800)
 const mcpErr = ref('')
 
-const mcpServers = ref<any[]>([])
+const allServers = ref<any[]>([])
+// Filtered servers: either all, or only those matching active library.
+const mcpServers = computed(() => {
+  const list = allServers.value || []
+  if (showAllDomains.value || !activeLibraryId.value) return list
+  return list.filter((s: any) => !s.libraryId || s.libraryId === activeLibraryId.value)
+})
 const recommends = ref<any[]>([])
 const editingSrv = ref<any>(null)
 const srvForm = reactive({ name: '', transport: 'stdio', command: '', argsText: '', url: '' })
@@ -280,7 +301,8 @@ async function saveMCPPort() {
 
 // ── MCP Server management ──
 async function loadMCPServers() {
-  try { mcpServers.value = await mcpApi.listServers() || [] } catch (_) {}
+  try { allServers.value = await mcpApi.listServers() || [] } catch (_) {}
+  try { domainLibs.value = (await memoryApi.libraryList()) || [] } catch (_) {}
 }
 
 async function loadRecommends() {
@@ -311,6 +333,7 @@ async function saveMCPServer() {
     args: args,
     url: srvForm.url.trim(),
     status: 'disconnected',
+    libraryId: activeLibraryId.value || (editingSrv.value ? editingSrv.value.libraryId : ''),
   }
   saving.value = true
   try {

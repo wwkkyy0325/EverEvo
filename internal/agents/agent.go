@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"everevo/internal/atomic"
@@ -47,10 +48,13 @@ type Agent struct {
 // BaseSystemPrompt is the default persona prompt for the main agent. It mirrors
 // the chat base prompt (chatStore.ts) so the seeded default agent reproduces the
 // pre-existing chat behavior exactly.
-const BaseSystemPrompt = "你是 EverEvo 桌面软件的 AI 助手。用户说中文，用中文回复。当需要执行操作时使用工具调用。每次回复尽量简洁。\n\n用户可能通过拖拽或粘贴上传文件到对话中。对于文本文件（TXT、MD、CSV、JSON 等），内容会自动注入。对于 PDF 和图片文件，请使用 read_file 或 read_media_file 工具读取。对于扫描件 PDF（isScanned=true），请使用 read_media_file 工具以图片形式查看页面。"
+const BaseSystemPrompt = "你是 EverEvo 桌面软件的 AI 助手。用户说中文，用中文回复。当需要执行操作时使用工具调用。每次回复尽量简洁。\n\n用户可能通过拖拽或粘贴上传文件到对话中。对于文本文件（TXT、MD、CSV、JSON 等），内容会自动注入。对于 PDF 和图片文件，请使用 read_file 或 read_media_file 工具读取。对于扫描件 PDF（isScanned=true），请使用 read_media_file 工具以图片形式查看页面。\n\n【任务规划】面对多步骤的复杂任务，先用 plan_create 把任务拆解成有序步骤清单，每完成一步用 plan_step_update 标记 done。这样用户能在协同工作台实时看到进度。\n\n【多 Agent 协同】当任务需要跨领域协作时，用 collab_create 创建协同会话，用 collab_dispatch_async 并发派发给领域 agent，用 blackboard_set 共享中间结果，最后 collab_wait 汇总。"
 
-// Manager holds the agent list and handles persistence.
+// Manager holds the agent list and handles persistence. All mutating ops take
+// the mutex because concurrent multi-domain delegation + UI CRUD race on the
+// Agents slice (and on Save).
 type Manager struct {
+	mu     sync.RWMutex
 	Agents []Agent `json:"agents"`
 }
 
@@ -75,8 +79,36 @@ func NewManager() *Manager {
 		m.Agents = append(m.Agents, defaultAgent())
 		_ = m.Save()
 	}
+	// Migrate the default agent's system prompt to the latest BaseSystemPrompt
+	// when it lacks the collaboration/planning guidance. Safe for user-customized
+	// prompts: only touches agents whose prompt matches the old built-in shape
+	// (no "【任务规划】" marker = pre-collab version).
+	m.migrateDefaultPrompt()
 	log.Printf("[agents] 已加载 %d 个本地 Agent", len(m.Agents))
 	return m
+}
+
+// migrateDefaultPrompt updates the default agent's SystemPrompt to the current
+// BaseSystemPrompt if it was seeded from an older version. Detected by the
+// absence of the "【任务规划】" marker that the new prompt always contains.
+// User-customized prompts that happen to omit the marker are also updated —
+// the trade-off for keeping the built-in default fresh across upgrades.
+func (m *Manager) migrateDefaultPrompt() {
+	changed := false
+	for i := range m.Agents {
+		if !m.Agents[i].IsDefault {
+			continue
+		}
+		if !strings.Contains(m.Agents[i].SystemPrompt, "【任务规划】") {
+			m.Agents[i].SystemPrompt = BaseSystemPrompt
+			m.Agents[i].UpdatedAt = time.Now().UnixMilli()
+			changed = true
+			log.Printf("[agents] 默认 Agent prompt 已升级（加入协同/规划引导）")
+		}
+	}
+	if changed {
+		_ = m.Save()
+	}
 }
 
 func (m *Manager) hasDefault() bool {
@@ -120,7 +152,15 @@ func loadFromDisk() []Agent {
 }
 
 // Save persists the agent list to disk atomically.
+// Save persists the agent list to disk atomically. Takes the write lock.
 func (m *Manager) Save() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.saveLocked()
+}
+
+// saveLocked persists without taking the lock — for callers already holding it.
+func (m *Manager) saveLocked() error {
 	path := agentsPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("创建 agents 目录失败: %w", err)
@@ -136,10 +176,16 @@ func (m *Manager) Save() error {
 }
 
 // List returns all agents.
-func (m *Manager) List() []Agent { return m.Agents }
+func (m *Manager) List() []Agent {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Agents
+}
 
 // Get returns an agent by ID.
 func (m *Manager) Get(id string) (*Agent, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for i := range m.Agents {
 		if m.Agents[i].ID == id {
 			return &m.Agents[i], nil
@@ -150,6 +196,8 @@ func (m *Manager) Get(id string) (*Agent, error) {
 
 // FindByName returns the first agent matching the given name (case-insensitive).
 func (m *Manager) FindByName(name string) (*Agent, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for i := range m.Agents {
 		if equalFoldName(m.Agents[i].Name, name) {
 			return &m.Agents[i], nil
@@ -163,13 +211,15 @@ func (m *Manager) Create(a Agent) (*Agent, error) {
 	if a.Name == "" {
 		return nil, fmt.Errorf("agent 名称不能为空")
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	now := time.Now().UnixMilli()
 	a.ID = newID()
 	a.IsDefault = false // only the seeded default is default
 	a.CreatedAt = now
 	a.UpdatedAt = now
 	m.Agents = append(m.Agents, a)
-	if err := m.Save(); err != nil {
+	if err := m.saveLocked(); err != nil {
 		m.Agents = m.Agents[:len(m.Agents)-1]
 		return nil, err
 	}
@@ -178,6 +228,8 @@ func (m *Manager) Create(a Agent) (*Agent, error) {
 
 // Update modifies an existing agent by ID.
 func (m *Manager) Update(id string, a Agent) (*Agent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for i := range m.Agents {
 		if m.Agents[i].ID == id {
 			a.ID = id
@@ -185,7 +237,7 @@ func (m *Manager) Update(id string, a Agent) (*Agent, error) {
 			a.UpdatedAt = time.Now().UnixMilli()
 			a.IsDefault = m.Agents[i].IsDefault // default flag is immutable here
 			m.Agents[i] = a
-			if err := m.Save(); err != nil {
+			if err := m.saveLocked(); err != nil {
 				return nil, err
 			}
 			return &m.Agents[i], nil
@@ -196,13 +248,15 @@ func (m *Manager) Update(id string, a Agent) (*Agent, error) {
 
 // Delete removes an agent by ID. The default agent cannot be deleted.
 func (m *Manager) Delete(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for i := range m.Agents {
 		if m.Agents[i].ID == id {
 			if m.Agents[i].IsDefault {
 				return fmt.Errorf("默认主 Agent 不能删除")
 			}
 			m.Agents = append(m.Agents[:i], m.Agents[i+1:]...)
-			return m.Save()
+			return m.saveLocked()
 		}
 	}
 	return fmt.Errorf("agent %q 不存在", id)
@@ -236,12 +290,20 @@ func (m *Manager) GetCoreAgent(defaultLibraryID string) (*Agent, error) {
 	return nil, fmt.Errorf("no core agent found")
 }
 
-// EnsureLibraryIDs backfills empty LibraryID fields with the given default ID
-// and saves. Safe to call at startup after the memory store is ready.
-func (m *Manager) EnsureLibraryIDs(defaultLibraryID string) error {
+// EnsureLibraryIDs backfills empty or invalid LibraryID fields with the given
+// default ID and saves. Safe to call at startup after the memory store is ready.
+// validIDs is the set of current domain library IDs from the memory store.
+func (m *Manager) EnsureLibraryIDs(defaultLibraryID string, validIDs []string) error {
+	valid := make(map[string]bool, len(validIDs))
+	for _, id := range validIDs {
+		valid[id] = true
+	}
 	changed := false
 	for i := range m.Agents {
-		if m.Agents[i].LibraryID == "" {
+		if m.Agents[i].LibraryID == "" || !valid[m.Agents[i].LibraryID] {
+			if m.Agents[i].LibraryID != "" {
+				log.Printf("[agents] Agent %q 的 libraryId %q 无效，回填为默认领域", m.Agents[i].Name, m.Agents[i].LibraryID)
+			}
 			m.Agents[i].LibraryID = defaultLibraryID
 			changed = true
 		}

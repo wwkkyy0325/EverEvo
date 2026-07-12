@@ -32,6 +32,7 @@ function errMsg(e: unknown): string {
 
 /**
  * Call a Wails backend function with timeout and abort support.
+ * Returns null-guarded: null/undefined array results are coerced to [].
  */
 export async function call<T>(fn: () => Promise<T>, opts: CallOptions = {}): Promise<T> {
   const { timeout = 30_000, signal } = opts
@@ -63,7 +64,16 @@ export async function call<T>(fn: () => Promise<T>, opts: CallOptions = {}): Pro
     }
 
     fn()
-      .then((val) => finish(() => resolve(val)))
+      .then((val) => {
+        // Root fix: Go nil slices marshal to null over Wails bridge.
+        // Coerce null arrays to empty arrays so downstream .filter()/.map()
+        // never see null. Non-array types pass through unchanged.
+        if (val === null || val === undefined) {
+          resolve([] as unknown as T)
+        } else {
+          resolve(val)
+        }
+      })
       .catch((e) => finish(() => reject(new ApiError(errMsg(e), 'BACKEND_ERROR', errMsg(e)))))
       .finally(() => clearTimeout(tid))
   })

@@ -8,6 +8,8 @@ import (
 	"math"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver (no CGo)
@@ -210,6 +212,45 @@ CREATE TABLE IF NOT EXISTS experience_items (
 	last_used    INTEGER NOT NULL DEFAULT 0,
 	created_at   INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS collab_sessions (
+	id                TEXT PRIMARY KEY,
+	goal              TEXT NOT NULL DEFAULT '',
+	orchestrator_id   TEXT NOT NULL DEFAULT '',
+	blackboard_id     TEXT NOT NULL DEFAULT '',
+	status            TEXT NOT NULL DEFAULT 'active',
+	created_at        INTEGER NOT NULL,
+	updated_at        INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collab_members (
+	session_id  TEXT NOT NULL,
+	agent_id    TEXT NOT NULL,
+	role        TEXT NOT NULL DEFAULT 'member',
+	joined_at   INTEGER NOT NULL,
+	PRIMARY KEY (session_id, agent_id)
+);
+CREATE TABLE IF NOT EXISTS bb_entries (
+	board_id    TEXT NOT NULL,
+	key         TEXT NOT NULL,
+	value       TEXT NOT NULL DEFAULT '',
+	author      TEXT NOT NULL DEFAULT '',
+	kind        TEXT NOT NULL DEFAULT 'text',
+	updated_at  INTEGER NOT NULL,
+	PRIMARY KEY (board_id, key)
+);
+CREATE TABLE IF NOT EXISTS activity_log (
+	id           TEXT PRIMARY KEY,
+	ts           INTEGER NOT NULL,
+	kind         TEXT NOT NULL,
+	topic        TEXT NOT NULL DEFAULT '',
+	source       TEXT NOT NULL DEFAULT '',
+	source_name  TEXT NOT NULL DEFAULT '',
+	session_id   TEXT NOT NULL DEFAULT '',
+	summary      TEXT NOT NULL DEFAULT '',
+	payload      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity_log(ts);
+CREATE INDEX IF NOT EXISTS idx_activity_kind ON activity_log(kind);
+CREATE INDEX IF NOT EXISTS idx_activity_session ON activity_log(session_id);
 `
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
@@ -236,6 +277,15 @@ CREATE TABLE IF NOT EXISTS experience_items (
 	// P9: usage tracking on domain libraries.
 	if err := s.addColumnIfMissing("domain_libraries", "use_count", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
+	}
+	// P10: domain-as-container — icon + sort_order for UI organization.
+	for _, c := range []struct{ table, col, def string }{
+		{"domain_libraries", "icon", "TEXT NOT NULL DEFAULT '📚'"},
+		{"domain_libraries", "sort_order", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.addColumnIfMissing(c.table, c.col, c.def); err != nil {
+			return err
+		}
 	}
 	// P5: add decay columns to memory_items for existing DBs (SQLite has no
 	// ADD COLUMN IF NOT EXISTS, so guard via pragma_table_info).
@@ -443,10 +493,48 @@ func (s *Store) ClearMessages(sessionID string) error {
 	return err
 }
 
-// UpdateMessageToolJSON updates the tool_json column of a message.
-func (s *Store) UpdateMessageToolJSON(msgID, toolJSON string) error {
-	_, err := s.db.Exec(`UPDATE messages SET tool_json = ? WHERE id = ?`, toolJSON, msgID)
+// UpdateMessageToolJSON merges newToolJSON into the existing tool_json column
+// rather than replacing it. This prevents data loss when multiple writes target
+// the same message (e.g., first write has tool_calls+reasoning, second write adds
+// tool_results — the merge preserves reasoning).
+func (s *Store) UpdateMessageToolJSON(msgID, newToolJSON string) error {
+	// Read existing.
+	var existing string
+	err := s.db.QueryRow(`SELECT tool_json FROM messages WHERE id = ?`, msgID).Scan(&existing)
+	if err != nil {
+		return err
+	}
+	merged := mergeJSON(existing, newToolJSON)
+	_, err = s.db.Exec(`UPDATE messages SET tool_json = ? WHERE id = ?`, merged, msgID)
 	return err
+}
+
+// mergeJSON shallow-merges newJSON into existing JSON string. New keys overwrite
+// existing keys of the same name; existing keys not in newJSON are preserved.
+// Both strings must be valid JSON objects (or empty).
+func mergeJSON(existing, newJSON string) string {
+	if existing == "" || existing == "null" {
+		return newJSON
+	}
+	if newJSON == "" || newJSON == "null" {
+		return existing
+	}
+	// Parse both as map[string]any, merge, re-serialize.
+	var em, nm map[string]any
+	if err := json.Unmarshal([]byte(existing), &em); err != nil {
+		return newJSON // existing is corrupt — replace
+	}
+	if err := json.Unmarshal([]byte(newJSON), &nm); err != nil {
+		return existing // new is corrupt — keep existing
+	}
+	for k, v := range nm {
+		em[k] = v
+	}
+	out, err := json.Marshal(em)
+	if err != nil {
+		return existing
+	}
+	return string(out)
 }
 
 // CountMessages returns the message count of a session (for summary cadence).
@@ -551,13 +639,14 @@ type EntityHit struct {
 
 // MemoryItem is a manifest row for UI listing / counts / clear.
 type MemoryItem struct {
-	ID        string `json:"id"`
-	Kind      string `json:"kind"` // turn | fact
-	Content   string `json:"content"`
-	Reply     string `json:"reply"`
-	Category  string `json:"category"`
-	SessionID string `json:"sessionId"`
-	CreatedAt int64  `json:"createdAt"`
+	ID          string `json:"id"`
+	Kind        string `json:"kind"` // turn | fact
+	Content     string `json:"content"`
+	Reply       string `json:"reply"`
+	Category    string `json:"category"`
+	SessionID   string `json:"sessionId"`
+	CreatedAt   int64  `json:"createdAt"`
+	WorkspaceID string `json:"workspaceId,omitempty"`
 }
 
 // HasVector reports whether the vector layer is available.
@@ -565,19 +654,28 @@ func (s *Store) HasVector() bool { return s.vector != nil }
 
 // AddTurnMemory writes a user-question turn to both the SQLite manifest and the
 // chromem collection (question vectorized; reply carried in metadata).
-func (s *Store) AddTurnMemory(itemID, userText, reply, sessionID string, userEmb []float32) error {
+// libraryID is stored as workspace_id for per-domain isolation.
+func (s *Store) AddTurnMemory(itemID, userText, reply, sessionID, libraryID string, userEmb []float32) error {
 	now := time.Now().UnixMilli()
-	if _, err := s.db.Exec(`INSERT INTO memory_items(id, kind, content, reply, category, session_id, created_at)
-		VALUES(?, 'turn', ?, ?, '', ?, ?)`, itemID, userText, reply, sessionID, now); err != nil {
+	if libraryID == "" {
+		libraryID = s.realDefaultLibrary()
+	}
+	if _, err := s.db.Exec(`INSERT INTO memory_items(id, kind, content, reply, category, session_id, created_at, workspace_id)
+		VALUES(?, 'turn', ?, ?, '', ?, ?, ?)`, itemID, userText, reply, sessionID, now, libraryID); err != nil {
 		return err
 	}
 	if s.vector != nil {
-		if err := s.vector.AddTurn(itemID, userText, reply, sessionID, itemID, userEmb); err != nil {
+		if err := s.vector.AddTurn(itemID, userText, reply, sessionID, itemID, libraryID, userEmb); err != nil {
 			return err
 		}
 	}
 	return nil
 }
+
+// factDedupThreshold is the cosine similarity at which two facts are treated as
+// the same fact (a paraphrase). Short factual sentences cluster tightly with a
+// sentence-embedding model, so 0.90 catches "用户喜欢 Go" vs "用户喜爱的语言是 Go".
+const factDedupThreshold = 0.90
 
 // AddFactMemory writes an extracted fact to both stores. importance tags the
 // row for decay-rate adjustment (low → forgets faster); high-importance facts
@@ -587,7 +685,21 @@ func (s *Store) AddFactMemory(itemID, content, category, importance, libraryID, 
 		importance = "normal"
 	}
 	if libraryID == "" {
-		libraryID = "default"
+		libraryID = s.realDefaultLibrary()
+	}
+	// Dedup (mirrors AddUserFact): the extractor re-runs every N turns and tends
+	// to emit the same fact 3-5× with minor wording changes. Skip exact and
+	// semantic duplicates so each distinct fact is stored once.
+	var existing int
+	s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE workspace_id = ? AND kind = 'fact' AND content = ?`,
+		libraryID, content).Scan(&existing)
+	if existing > 0 {
+		return nil // exact duplicate — no-op
+	}
+	if s.vector != nil && len(emb) > 0 {
+		if hits, _ := s.vector.QueryFacts(emb, 1, libraryID); len(hits) > 0 && hits[0].Similarity >= factDedupThreshold {
+			return nil // semantic duplicate (paraphrase) — no-op
+		}
 	}
 	now := time.Now().UnixMilli()
 	if _, err := s.db.Exec(`INSERT INTO memory_items(id, kind, content, reply, category, session_id, created_at, importance, workspace_id, cross_tags)
@@ -595,7 +707,7 @@ func (s *Store) AddFactMemory(itemID, content, category, importance, libraryID, 
 		return err
 	}
 	if s.vector != nil {
-		if err := s.vector.AddFact(itemID, content, category, itemID, emb); err != nil {
+		if err := s.vector.AddFact(itemID, content, category, itemID, libraryID, emb); err != nil {
 			return err
 		}
 	}
@@ -603,10 +715,123 @@ func (s *Store) AddFactMemory(itemID, content, category, importance, libraryID, 
 }
 
 
-// DeleteMemoryItem removes one item from memory_items by ID.
+// DedupAllFacts runs a one-time pass that deduplicates historical fact memory
+// items by exact content match within the same library. Called at startup.
+// Returns the number of duplicates removed.
+func (s *Store) DedupAllFacts() error {
+	if s.GetMeta("fact_consolidation_done") != "" {
+		return nil
+	}
+	rows, err := s.db.Query(`SELECT id, content, workspace_id FROM memory_items WHERE kind='fact' ORDER BY created_at ASC`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type fact struct {
+		id, content, lib string
+	}
+	var facts []fact
+	for rows.Next() {
+		var f fact
+		if err := rows.Scan(&f.id, &f.content, &f.lib); err != nil {
+			return err
+		}
+		facts = append(facts, f)
+	}
+	seen := map[string]string{} // key: libID+"|"+content → id (keep first)
+	removed := 0
+	for _, f := range facts {
+		key := f.lib + "|" + f.content
+		if keepID, exists := seen[key]; exists {
+			// Delete duplicate, keep the first one.
+			s.db.Exec(`DELETE FROM memory_items WHERE id = ?`, f.id)
+			if s.vector != nil {
+				_ = s.vector.Delete(f.id)
+			}
+			// Update the kept one's access count to reflect consolidation.
+			s.db.Exec(`UPDATE memory_items SET access_count = access_count + 1 WHERE id = ?`, keepID)
+			removed++
+		} else {
+			seen[key] = f.id
+		}
+	}
+	if removed > 0 {
+		log.Printf("[memory] 历史事实去重: 移除 %d 条重复记录", removed)
+	}
+	_ = s.SetMeta("fact_consolidation_done", "1")
+	return nil
+}
+
+// DedupUserFacts consolidates duplicate user_facts rows by key, keeping the
+// most recent entry (by last_access then created_at) and merging access counts.
+// Called at startup; safe to run multiple times.
+func (s *Store) DedupUserFacts() (removed int, _ error) {
+	rows, err := s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at, last_access, access_count FROM user_facts ORDER BY key, created_at DESC`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	type uf struct {
+		id                        string
+		key, value, category, imp string
+		locked                    int
+		source                    string
+		createdAt, lastAccess     int64
+		accessCount               int
+	}
+	var facts []uf
+	for rows.Next() {
+		var f uf
+		if err := rows.Scan(&f.id, &f.key, &f.value, &f.category, &f.imp, &f.locked, &f.source, &f.createdAt, &f.lastAccess, &f.accessCount); err != nil {
+			return 0, err
+		}
+		facts = append(facts, f)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	// Group by key (case-insensitive + trimmed)
+	seen := map[string]*uf{} // normalized_key → best entry
+	for i := range facts {
+		f := &facts[i]
+		norm := strings.ToLower(strings.TrimSpace(f.key))
+		if best, exists := seen[norm]; exists {
+			// Merge: keep the entry with highest access_count; sum access counts
+			if f.accessCount > best.accessCount || (f.accessCount == best.accessCount && f.lastAccess > best.lastAccess) {
+				// Promote this one as best; merge access count from old best
+				f.accessCount += best.accessCount
+				f.lastAccess = max(f.lastAccess, best.lastAccess)
+				s.db.Exec(`DELETE FROM user_facts WHERE id = ?`, best.id)
+				removed++
+				seen[norm] = f
+			} else {
+				best.accessCount += f.accessCount
+				best.lastAccess = max(best.lastAccess, f.lastAccess)
+				s.db.Exec(`UPDATE user_facts SET access_count = ?, last_access = ? WHERE id = ?`, best.accessCount, best.lastAccess, best.id)
+				s.db.Exec(`DELETE FROM user_facts WHERE id = ?`, f.id)
+				removed++
+			}
+		} else {
+			seen[norm] = f
+		}
+	}
+	if removed > 0 {
+		log.Printf("[memory] 核心记忆去重: 移除 %d 条重复记录 (key 维度)", removed)
+	}
+	return removed, nil
+}
+
+// DeleteMemoryItem removes one item from memory_items by ID and deletes its
+// orphan vector (prevents stale chromem docs that outlive their SQLite row).
 func (s *Store) DeleteMemoryItem(id string) error {
 	_, err := s.db.Exec(`DELETE FROM memory_items WHERE id = ?`, id)
-	return err
+	if err != nil {
+		return err
+	}
+	if s.vector != nil {
+		_ = s.vector.Delete(id) // best-effort orphan cleanup
+	}
+	return nil
 }
 // UserFact is a permanent core-memory row (identity/preference/constraint) —
 // never decayed or TTL'd.
@@ -621,20 +846,38 @@ type UserFact struct {
 	CreatedAt  int64  `json:"createdAt"`
 }
 
-// AddUserFact inserts a core-memory row.
-func (s *Store) AddUserFact(id, key, value, category, importance, source string) error {
+// AddUserFact inserts a core-memory row scoped to a domain library.
+// workspaceID empty → real default library (not the "default" sentinel).
+func (s *Store) AddUserFact(id, key, value, category, importance, source, workspaceID string) error {
 	if importance == "" {
 		importance = "high"
 	}
+	if workspaceID == "" {
+		workspaceID = s.realDefaultLibrary()
+	}
+	// Dedup: skip if an identical key+value already exists in this workspace.
+	// Stops the LLM from re-extracting "用户名为 wky" 5 times into 5 rows.
+	var existing int
+	s.db.QueryRow(`SELECT COUNT(*) FROM user_facts WHERE workspace_id = ? AND key = ? AND value = ?`, workspaceID, key, value).Scan(&existing)
+	if existing > 0 {
+		return nil // duplicate of an existing core fact — no-op
+	}
 	now := time.Now().UnixMilli()
-	_, err := s.db.Exec(`INSERT INTO user_facts(id, key, value, category, importance, locked, source, created_at, last_access, access_count)
-		VALUES(?, ?, ?, ?, ?, 0, ?, ?, ?, 0)`, id, key, value, category, importance, source, now, now)
+	_, err := s.db.Exec(`INSERT INTO user_facts(id, key, value, category, importance, locked, source, created_at, last_access, access_count, workspace_id)
+		VALUES(?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?)`, id, key, value, category, importance, source, now, now, workspaceID)
 	return err
 }
 
-// ListUserFacts returns all core-memory rows (newest first).
-func (s *Store) ListUserFacts() ([]UserFact, error) {
-	rows, err := s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts ORDER BY created_at DESC`)
+// ListUserFacts returns core-memory rows for a domain library (newest first).
+// workspaceID "" → all (global view); otherwise scoped to that library.
+func (s *Store) ListUserFacts(workspaceID string) ([]UserFact, error) {
+	var rows *sql.Rows
+	var err error
+	if workspaceID == "" {
+		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts ORDER BY created_at DESC`)
+	} else {
+		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts WHERE workspace_id = ? OR workspace_id = 'default' ORDER BY created_at DESC`, workspaceID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -736,17 +979,67 @@ func (s *Store) DefaultLibrary() (string, error) {
 	return id, err
 }
 
+// realDefaultLibrary returns the real DefaultLibrary ID (never the literal
+// "default"). Used to avoid scattering the sentinel "default" string across
+// memory_items, which breaks per-library queries. Falls back to "default"
+// only if the DB itself is unavailable.
+func (s *Store) realDefaultLibrary() string {
+	id, err := s.DefaultLibrary()
+	if err != nil || id == "" {
+		return "default"
+	}
+	return id
+}
+
+// LastTurnLibrary returns the workspace_id of the most recent turn memory item.
+// Used by the extraction scheduler so extracted facts land in the SAME library
+// as the conversation that produced them (not always the core library).
+func (s *Store) LastTurnLibrary() string {
+	var ws string
+	if err := s.db.QueryRow(`SELECT workspace_id FROM memory_items WHERE kind='turn' ORDER BY created_at DESC LIMIT 1`).Scan(&ws); err == nil && ws != "" {
+		return ws
+	}
+	return s.realDefaultLibrary()
+}
+
+// ListLibraryIDs returns all valid domain library IDs. Used by other subsystems
+// to validate and fix dangling LibraryID references at startup.
+func (s *Store) ListLibraryIDs() []string {
+	rows, err := s.db.Query(`SELECT id FROM domain_libraries`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// IsValidLibrary returns true if the given library ID exists in domain_libraries.
+func (s *Store) IsValidLibrary(id string) bool {
+	var ok int
+	err := s.db.QueryRow(`SELECT 1 FROM domain_libraries WHERE id = ?`, id).Scan(&ok)
+	return err == nil && ok == 1
+}
+
 // LibraryList returns all domain libraries.
 func (s *Store) LibraryList() ([]struct {
 	ID          string
 	Name        string
 	Description string
+	Icon        string
 	Tags        string
 	AutoCreated bool
 	UseCount    int
+	SortOrder   int
 	CreatedAt   int64
 }, error) {
-	rows, err := s.db.Query(`SELECT id, name, description, tags, auto_created, COALESCE(use_count,0), created_at FROM domain_libraries ORDER BY use_count DESC, auto_created ASC`)
+	rows, err := s.db.Query(`SELECT id, name, description, COALESCE(icon,'📚'), tags, auto_created, COALESCE(use_count,0), COALESCE(sort_order,0), created_at FROM domain_libraries ORDER BY sort_order ASC, use_count DESC, auto_created ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -755,9 +1048,11 @@ func (s *Store) LibraryList() ([]struct {
 		ID          string
 		Name        string
 		Description string
+		Icon        string
 		Tags        string
 		AutoCreated bool
 		UseCount    int
+		SortOrder   int
 		CreatedAt   int64
 	}
 	for rows.Next() {
@@ -765,13 +1060,15 @@ func (s *Store) LibraryList() ([]struct {
 			ID          string
 			Name        string
 			Description string
+			Icon        string
 			Tags        string
 			AutoCreated bool
 			UseCount    int
+			SortOrder   int
 			CreatedAt   int64
 		}
 		var ac int
-		if err := rows.Scan(&lib.ID, &lib.Name, &lib.Description, &lib.Tags, &ac, &lib.UseCount, &lib.CreatedAt); err != nil {
+		if err := rows.Scan(&lib.ID, &lib.Name, &lib.Description, &lib.Icon, &lib.Tags, &ac, &lib.UseCount, &lib.SortOrder, &lib.CreatedAt); err != nil {
 			return nil, err
 		}
 		lib.AutoCreated = ac != 0
@@ -781,16 +1078,26 @@ func (s *Store) LibraryList() ([]struct {
 }
 
 // LibraryCreate adds a domain library and returns its id.
-func (s *Store) LibraryCreate(name, description string, autoCreated bool) (string, error) {
+func (s *Store) LibraryCreate(name, description, icon string, autoCreated bool) (string, error) {
 	id := fmt.Sprintf("lib_%x", time.Now().UnixNano())
 	ac := 0
 	if autoCreated {
 		ac = 1
 	}
+	if icon == "" {
+		icon = "📚"
+	}
 	now := time.Now().UnixMilli()
-	_, err := s.db.Exec(`INSERT INTO domain_libraries(id, name, description, auto_created, created_at) VALUES(?, ?, ?, ?, ?)`,
-		id, name, description, ac, now)
+	_, err := s.db.Exec(`INSERT INTO domain_libraries(id, name, description, icon, auto_created, created_at) VALUES(?, ?, ?, ?, ?, ?)`,
+		id, name, description, icon, ac, now)
 	return id, err
+}
+
+// LibraryUpdate updates a domain library's mutable fields.
+func (s *Store) LibraryUpdate(id, name, description, icon string) error {
+	_, err := s.db.Exec(`UPDATE domain_libraries SET name=?, description=?, icon=? WHERE id=?`,
+		name, description, icon, id)
+	return err
 }
 
 // LibraryDelete removes a library row. The caller should cascade data first.
@@ -821,6 +1128,66 @@ func (s *Store) LibraryMerge(keepID, dropID string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// PruneEmptyAutoLibraries deletes domain libraries that have no associated data
+// (no memory items, user facts, or KG nodes/edges) and are either auto-created
+// or have never been used (useCount=0, excluding the default/first domain).
+// Returns the number of libraries removed. Safe to call at startup.
+func (s *Store) PruneEmptyAutoLibraries() (removed int) {
+	// Get the default (first) library ID — never prune it.
+	defaultID, _ := s.DefaultLibrary()
+	// Find candidates: auto_created + zero use, OR manual + zero use + not default.
+	rows, err := s.db.Query(`SELECT id, auto_created FROM domain_libraries WHERE (auto_created = 1 OR COALESCE(use_count,0) = 0)`)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	type cand struct{ id string; auto bool }
+	var candidates []cand
+	for rows.Next() {
+		var c cand
+		var ac int
+		if err := rows.Scan(&c.id, &ac); err == nil {
+			c.auto = ac != 0
+			candidates = append(candidates, c)
+		}
+	}
+	for _, c := range candidates {
+		// Never prune the default library.
+		if c.id == defaultID {
+			continue
+		}
+		// Only prune manual domains if useCount is 0.
+		if !c.auto {
+			var uc int
+			s.db.QueryRow(`SELECT COALESCE(use_count,0) FROM domain_libraries WHERE id = ?`, c.id).Scan(&uc)
+			if uc > 0 {
+				continue
+			}
+		}
+		// Check each data table — if any has rows, skip.
+		hasData := false
+		for _, table := range []string{"memory_items", "user_facts", "kg_nodes", "kg_edges", "experience_items"} {
+			var n int
+			if err := s.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE workspace_id = ?", table), c.id).Scan(&n); err == nil && n > 0 {
+				hasData = true
+				break
+			}
+		}
+		if hasData {
+			continue
+		}
+		// No data in any table — safe to delete.
+		if _, err := s.db.Exec(`DELETE FROM domain_libraries WHERE id = ?`, c.id); err == nil {
+			removed++
+			log.Printf("[memory] 清理未使用领域: %s", c.id)
+		}
+	}
+	if removed > 0 {
+		log.Printf("[memory] 清理 %d 个未使用领域", removed)
+	}
+	return removed
 }
 
 // ─── Experience Items (P8) — reflection distilled insights ─────
@@ -856,6 +1223,99 @@ func (s *Store) ListExperience(workspaceID string, limit int) ([]ExperienceItem,
 		var e ExperienceItem
 		if err := rows.Scan(&e.ID, &e.WorkspaceID, &e.Kind, &e.Content, &e.Context, &e.Confidence, &e.UseCount, &e.LastUsed, &e.CreatedAt); err != nil { return nil, err }
 		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ─── Activity Log — unified AI-work timeline (collab observability) ────
+
+// ActivityRow is one recorded AI-work event (agent run / message / tool call /
+// workflow execution / plan / blackboard change). The unified timeline backs
+// both the live workbench and the history/replay view.
+type ActivityRow struct {
+	ID         string `json:"id"`
+	Ts         int64  `json:"ts"`
+	Kind       string `json:"kind"`       // agent_start | agent_done | agent_message | tool_call | workflow_start | workflow_node | workflow_done | session | plan | blackboard
+	Topic      string `json:"topic"`      // raw event topic
+	Source     string `json:"source"`     // agentId / execId
+	SourceName string `json:"sourceName"` // resolved display name (agent name / workflow name)
+	SessionID  string `json:"sessionId"`  // collab session or ""
+	Summary    string `json:"summary"`    // one-line human description
+	Payload    string `json:"payload"`    // original Event JSON, for replay/detail
+}
+
+// ActivityFilter parameterizes ListActivity. Zero-value fields are ignored.
+type ActivityFilter struct {
+	Kind      string `json:"kind,omitempty"`
+	SessionID string `json:"sessionId,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Since     int64  `json:"since,omitempty"`  // ts >=
+	Before    int64  `json:"before,omitempty"` // ts < (cursor for paging)
+	Limit     int    `json:"limit,omitempty"`
+}
+
+// activitySeq guarantees unique log IDs even when many events share the same
+// millisecond (avoids the PRIMARY KEY collision that a pure-timestamp ID hits in
+// tight bursts).
+var activitySeq uint64
+
+// LogActivity appends one AI-work event to the unified timeline. ID/Ts are
+// filled if zero. Best-effort: the app layer queues writes off the event bus.
+func (s *Store) LogActivity(r ActivityRow) error {
+	if r.ID == "" {
+		r.ID = fmt.Sprintf("act_%d_%d", r.Ts, atomic.AddUint64(&activitySeq, 1))
+	}
+	if r.Ts == 0 {
+		r.Ts = time.Now().UnixMilli()
+		r.ID = fmt.Sprintf("act_%d_%d", r.Ts, atomic.AddUint64(&activitySeq, 1))
+	}
+	_, err := s.db.Exec(`INSERT INTO activity_log(id, ts, kind, topic, source, source_name, session_id, summary, payload)
+		VALUES(?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.Ts, r.Kind, r.Topic, r.Source, r.SourceName, r.SessionID, r.Summary, r.Payload)
+	return err
+}
+
+// ListActivity returns timeline rows newest-first, optionally filtered.
+func (s *Store) ListActivity(f ActivityFilter) ([]ActivityRow, error) {
+	if f.Limit <= 0 {
+		f.Limit = 200
+	}
+	q := `SELECT id, ts, kind, topic, source, source_name, session_id, summary, payload FROM activity_log WHERE 1=1`
+	args := []any{}
+	if f.Kind != "" {
+		q += " AND kind=?"
+		args = append(args, f.Kind)
+	}
+	if f.SessionID != "" {
+		q += " AND session_id=?"
+		args = append(args, f.SessionID)
+	}
+	if f.Source != "" {
+		q += " AND source=?"
+		args = append(args, f.Source)
+	}
+	if f.Since > 0 {
+		q += " AND ts>=?"
+		args = append(args, f.Since)
+	}
+	if f.Before > 0 {
+		q += " AND ts<?"
+		args = append(args, f.Before)
+	}
+	q += " ORDER BY ts DESC LIMIT ?"
+	args = append(args, f.Limit)
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ActivityRow, 0) // empty not nil → JSON [] not null
+	for rows.Next() {
+		var r ActivityRow
+		if err := rows.Scan(&r.ID, &r.Ts, &r.Kind, &r.Topic, &r.Source, &r.SourceName, &r.SessionID, &r.Summary, &r.Payload); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }
@@ -1016,16 +1476,17 @@ func (s *Store) DeleteUserFact(id string) error {
 }
 
 // QueryMemory runs a two-pass recall: kind=turn (question↔question) and
-// kind=fact, each top-k. Embedding is computed once by the caller.
-func (s *Store) QueryMemory(emb []float32, k int) (turns []TurnHit, facts []FactHit, err error) {
+// kind=fact, each top-k, scoped to libraryID. Embedding is computed once by
+// the caller. libraryID "" → global (all libraries).
+func (s *Store) QueryMemory(emb []float32, k int, libraryID string) (turns []TurnHit, facts []FactHit, err error) {
 	if s.vector == nil {
 		return nil, nil, nil
 	}
-	turns, err = s.vector.QueryTurns(emb, k)
+	turns, err = s.vector.QueryTurns(emb, k, libraryID)
 	if err != nil {
 		return nil, nil, err
 	}
-	facts, err = s.vector.QueryFacts(emb, k)
+	facts, err = s.vector.QueryFacts(emb, k, libraryID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1249,9 +1710,11 @@ func (s *Store) PromoteByScore(keepCap int) (promoted, demoted, deleted int) {
 	}
 	defer rows.Close()
 	type scored struct {
-		id    string
-		score float64
-		imp   string
+		id       string
+		score    float64
+		imp      string
+		recalls  int
+		accesses int
 	}
 	var list []scored
 	for rows.Next() {
@@ -1262,24 +1725,40 @@ func (s *Store) PromoteByScore(keepCap int) (promoted, demoted, deleted int) {
 			continue
 		}
 		sc := ScoreMemory(rc, ac, qd, cdh, la, ca, tags, now)
-		list = append(list, scored{id, sc, imp})
+		list = append(list, scored{id, sc, imp, rc, ac})
 	}
-	// Sort by score descending
-	sort.Slice(list, func(i, j int) bool { return list[i].score > list[j].score })
-	// Promote top, demote bottom
+	// Sort by score descending (stable sort for deterministic behavior).
+	sort.SliceStable(list, func(i, j int) bool { return list[i].score > list[j].score })
+
+	// Safety: only delete when significantly over capacity (1.5x buffer).
+	// Only delete items with score below minimum threshold AND no usage history.
+	const minScoreThreshold = 0.15
+	const capacityBuffer = 1.5
+	softLimit := int(float64(keepCap) * capacityBuffer)
+
 	for i, v := range list {
+		// Promote high scorers.
 		if v.score >= 0.6 && v.imp == "normal" {
 			s.db.Exec(`UPDATE memory_items SET importance='high' WHERE id=?`, v.id)
 			promoted++
 		} else if v.score >= 0.6 && v.imp == "low" {
 			s.db.Exec(`UPDATE memory_items SET importance='normal' WHERE id=?`, v.id)
 			promoted++
-		} else if v.score < 0.2 && v.imp == "normal" && v.score < 0.2 {
+		} else if v.score < 0.2 && v.imp == "normal" {
 			s.db.Exec(`UPDATE memory_items SET importance='low' WHERE id=?`, v.id)
 			demoted++
 		}
-		// Delete lowest scoring items beyond cap
-		if i >= keepCap && v.imp != "critical" {
+
+		// Only delete if ALL conditions are met:
+		// 1. Beyond soft capacity limit (not hard cap)
+		// 2. Score below minimum threshold
+		// 3. Never been recalled or accessed
+		// 4. Not critical importance
+		if i >= softLimit &&
+			v.score < minScoreThreshold &&
+			v.recalls == 0 &&
+			v.accesses == 0 &&
+			v.imp != "critical" {
 			s.db.Exec(`DELETE FROM memory_items WHERE id=?`, v.id)
 			deleted++
 		}
@@ -1337,28 +1816,39 @@ func (s *Store) SweepExpiredPolicy() ([]string, error) {
 
 // AddEntity writes a graph-entity vector (kind=entity). No-op when the vector
 // layer is unavailable (graph degrades to SQLite-only — no seed-by-similarity).
-func (s *Store) AddEntity(nodeID, name, entityType string, emb []float32) error {
+func (s *Store) AddEntity(nodeID, name, entityType, workspaceID string, emb []float32) error {
 	if s.vector == nil {
 		return nil
 	}
-	return s.vector.AddEntity(nodeID, name, entityType, emb)
+	return s.vector.AddEntity(nodeID, name, entityType, workspaceID, emb)
 }
 
-// EntitySearch returns up to k entity seeds matching the embedding (vector layer).
-func (s *Store) EntitySearch(emb []float32, k int) ([]EntityHit, error) {
+// EntitySearch returns up to k entity seeds matching the embedding, scoped to
+// libraryID (legacy 'default' entities included).
+func (s *Store) EntitySearch(emb []float32, k int, libraryID string) ([]EntityHit, error) {
 	if s.vector == nil {
 		return nil, nil
 	}
-	return s.vector.QueryEntities(emb, k)
+	return s.vector.QueryEntities(emb, k, libraryID)
 }
 
-// ListMemoryItems returns the k most recent manifest rows (any kind).
-func (s *Store) ListMemoryItems(k int) ([]MemoryItem, error) {
+// ListMemoryItems returns the k most recent manifest rows (any kind),
+// optionally filtered by workspace_id.
+func (s *Store) ListMemoryItems(k int, workspaceID string) ([]MemoryItem, error) {
 	if k <= 0 {
 		k = 20
 	}
-	rows, err := s.db.Query(`SELECT id, kind, content, reply, category, session_id, created_at
-		FROM memory_items ORDER BY created_at DESC LIMIT ?`, k)
+	var rows *sql.Rows
+	var err error
+	if workspaceID != "" {
+		// Include legacy 'default' rows so pre-isolation data is still visible
+		// in any library view (consistent with kg_nodes behavior).
+		rows, err = s.db.Query(`SELECT id, kind, content, reply, category, session_id, created_at, workspace_id
+			FROM memory_items WHERE workspace_id = ? OR workspace_id = 'default' ORDER BY created_at DESC LIMIT ?`, workspaceID, k)
+	} else {
+		rows, err = s.db.Query(`SELECT id, kind, content, reply, category, session_id, created_at, workspace_id
+			FROM memory_items ORDER BY created_at DESC LIMIT ?`, k)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1366,7 +1856,7 @@ func (s *Store) ListMemoryItems(k int) ([]MemoryItem, error) {
 	var out []MemoryItem
 	for rows.Next() {
 		var m MemoryItem
-		if err := rows.Scan(&m.ID, &m.Kind, &m.Content, &m.Reply, &m.Category, &m.SessionID, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Kind, &m.Content, &m.Reply, &m.Category, &m.SessionID, &m.CreatedAt, &m.WorkspaceID); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -1377,7 +1867,7 @@ func (s *Store) ListMemoryItems(k int) ([]MemoryItem, error) {
 // ListMemoryItemsSince returns manifest rows created after ts (exclusive),
 // oldest first — used for incremental extraction (only turns since the last run).
 func (s *Store) ListMemoryItemsSince(ts int64) ([]MemoryItem, error) {
-	rows, err := s.db.Query(`SELECT id, kind, content, reply, category, session_id, created_at
+	rows, err := s.db.Query(`SELECT id, kind, content, reply, category, session_id, created_at, workspace_id
 		FROM memory_items WHERE created_at > ? ORDER BY created_at ASC`, ts)
 	if err != nil {
 		return nil, err
@@ -1386,7 +1876,7 @@ func (s *Store) ListMemoryItemsSince(ts int64) ([]MemoryItem, error) {
 	var out []MemoryItem
 	for rows.Next() {
 		var m MemoryItem
-		if err := rows.Scan(&m.ID, &m.Kind, &m.Content, &m.Reply, &m.Category, &m.SessionID, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Kind, &m.Content, &m.Reply, &m.Category, &m.SessionID, &m.CreatedAt, &m.WorkspaceID); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -1394,10 +1884,167 @@ func (s *Store) ListMemoryItemsSince(ts int64) ([]MemoryItem, error) {
 	return out, rows.Err()
 }
 
-// CountMemory returns the turn and fact counts.
-func (s *Store) CountMemory() (turns int, facts int) {
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='turn'`).Scan(&turns)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='fact'`).Scan(&facts)
+// ─── Collaboration sessions (persistence) ─────────────────────────
+
+// CollabSessionRow is the persisted shape of a collaboration session.
+type CollabSessionRow struct {
+	ID, Goal, OrchestratorID, BlackboardID, Status string
+	CreatedAt, UpdatedAt                            int64
+	Members                                         []CollabMemberRow
+}
+
+// CollabMemberRow is one member of a collaboration session.
+type CollabMemberRow struct {
+	AgentID, Role string
+	JoinedAt      int64
+}
+
+// SaveCollabSession upserts a collaboration session and its members.
+func (s *Store) SaveCollabSession(r CollabSessionRow) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO collab_sessions(id, goal, orchestrator_id, blackboard_id, status, created_at, updated_at)
+		VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET goal=excluded.goal, orchestrator_id=excluded.orchestrator_id,
+		blackboard_id=excluded.blackboard_id, status=excluded.status, updated_at=excluded.updated_at`,
+		r.ID, r.Goal, r.OrchestratorID, r.BlackboardID, r.Status, r.CreatedAt, r.UpdatedAt); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	// Replace members.
+	if _, err := tx.Exec(`DELETE FROM collab_members WHERE session_id = ?`, r.ID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, m := range r.Members {
+		if _, err := tx.Exec(`INSERT INTO collab_members(session_id, agent_id, role, joined_at) VALUES(?,?,?,?)`,
+			r.ID, m.AgentID, m.Role, m.JoinedAt); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ListCollabSessions returns all persisted collaboration sessions (with members).
+func (s *Store) ListCollabSessions() ([]CollabSessionRow, error) {
+	rows, err := s.db.Query(`SELECT id, goal, orchestrator_id, blackboard_id, status, created_at, updated_at FROM collab_sessions ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	var out []CollabSessionRow
+	for rows.Next() {
+		var r CollabSessionRow
+		if err := rows.Scan(&r.ID, &r.Goal, &r.OrchestratorID, &r.BlackboardID, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	rows.Close()
+	// Load members for each.
+	for i := range out {
+		mrows, err := s.db.Query(`SELECT agent_id, role, joined_at FROM collab_members WHERE session_id = ?`, out[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		for mrows.Next() {
+			var m CollabMemberRow
+			if err := mrows.Scan(&m.AgentID, &m.Role, &m.JoinedAt); err == nil {
+				out[i].Members = append(out[i].Members, m)
+			}
+		}
+		mrows.Close()
+	}
+	return out, nil
+}
+
+// DeleteCollabSession removes a collaboration session and its members.
+func (s *Store) DeleteCollabSession(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM collab_members WHERE session_id = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM collab_sessions WHERE id = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	// Clean up blackboard entries for this session.
+	boardID := "bb_" + id
+	if _, err := tx.Exec(`DELETE FROM bb_entries WHERE board_id = ?`, boardID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// ─── Blackboard entries (persistence) ───────────────────────────
+
+// BBSaveEntry upserts a blackboard entry.
+func (s *Store) BBSaveEntry(boardID, key, value, author, kind string, updatedAt int64) error {
+	_, err := s.db.Exec(`INSERT INTO bb_entries(board_id, key, value, author, kind, updated_at)
+		VALUES(?,?,?,?,?,?) ON CONFLICT(board_id, key) DO UPDATE SET
+		value=excluded.value, author=excluded.author, kind=excluded.kind, updated_at=excluded.updated_at`,
+		boardID, key, value, author, kind, updatedAt)
+	return err
+}
+
+// BBDeleteEntry removes a single blackboard entry.
+func (s *Store) BBDeleteEntry(boardID, key string) error {
+	_, err := s.db.Exec(`DELETE FROM bb_entries WHERE board_id = ? AND key = ?`, boardID, key)
+	return err
+}
+
+// BBLoadEntries returns all entries for a given blackboard.
+func (s *Store) BBLoadEntries(boardID string) ([]BBEntry, error) {
+	rows, err := s.db.Query(`SELECT board_id, key, value, author, kind, updated_at
+		FROM bb_entries WHERE board_id = ? ORDER BY updated_at DESC`, boardID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BBEntry
+	for rows.Next() {
+		var e BBEntry
+		if err := rows.Scan(&e.BoardID, &e.Key, &e.Value, &e.Author, &e.Kind, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// BBClearBoard removes all entries for a blackboard.
+func (s *Store) BBClearBoard(boardID string) error {
+	_, err := s.db.Exec(`DELETE FROM bb_entries WHERE board_id = ?`, boardID)
+	return err
+}
+
+// BBEntry is a persisted blackboard entry.
+type BBEntry struct {
+	BoardID   string `json:"boardId"`
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	Author    string `json:"author"`
+	Kind      string `json:"kind"`
+	UpdatedAt int64  `json:"updatedAt"`
+}
+
+// CountMemory returns the turn and fact counts, optionally filtered by workspace_id.
+func (s *Store) CountMemory(workspaceID string) (turns int, facts int) {
+	if workspaceID != "" {
+		// Match ListMemoryItems: include legacy 'default' rows so counts agree.
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='turn' AND (workspace_id = ? OR workspace_id = 'default')`, workspaceID).Scan(&turns)
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='fact' AND (workspace_id = ? OR workspace_id = 'default')`, workspaceID).Scan(&facts)
+	} else {
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='turn'`).Scan(&turns)
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM memory_items WHERE kind='fact'`).Scan(&facts)
+	}
 	return
 }
 
@@ -1502,12 +2149,16 @@ func (s *Store) MigrateModel(newDir string, embedBatch func([]string) ([][]float
 		return err
 	}
 	for i, it := range items {
+		ws := it.WorkspaceID
+		if ws == "" {
+			ws = "default"
+		}
 		if it.Kind == "turn" {
-			if err := s.vector.AddTurn(it.ID, it.Content, it.Reply, it.SessionID, it.ID, vecs[i]); err != nil {
+			if err := s.vector.AddTurn(it.ID, it.Content, it.Reply, it.SessionID, it.ID, ws, vecs[i]); err != nil {
 				log.Printf("[memory] 迁移写入失败 %s: %v", it.ID, err)
 			}
 		} else {
-			if err := s.vector.AddFact(it.ID, it.Content, it.Category, it.ID, vecs[i]); err != nil {
+			if err := s.vector.AddFact(it.ID, it.Content, it.Category, it.ID, ws, vecs[i]); err != nil {
 				log.Printf("[memory] 迁移写入失败 %s: %v", it.ID, err)
 			}
 		}

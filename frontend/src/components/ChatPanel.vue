@@ -128,18 +128,28 @@
 
           <div class="chat-asst-text" v-html="chat.chatRender(m.content)"></div>
 
-          <!-- Tool calls — one collapsible block per tool -->
+          <!-- Tool calls — terminal-style blocks with live execution state -->
           <div v-for="(tc, j) in m.toolCalls" :key="tc.name"
                class="chat-meta-block chat-meta-tool"
-               :class="{ 'chat-meta-tool-err': m.toolResults?.[j]?.result?.success === false }">
-            <div class="chat-meta-head" @click="chat.expandedTool[i + '-' + j] = !chat.expandedTool[i + '-' + j]">
-              <span class="chat-meta-label">工具调用</span>
-              <span v-if="m.toolResults?.[j]?.result?.success === false" class="chat-meta-warn">⚠</span>
+               :class="toolBlockClass(m, j)">
+            <div class="chat-meta-head" @click="toolResultReady(m, j) && (chat.expandedTool[i + '-' + j] = !chat.expandedTool[i + '-' + j])">
+              <span class="chat-meta-label terminal-label">
+                <span v-if="!toolResultReady(m, j)" class="terminal-spin">◐</span>
+                <span v-else-if="m.toolResults?.[j]?.result?.success === false">✗</span>
+                <span v-else>✓</span>
+              </span>
               <span class="chat-meta-tool-name">{{ tc.name }}</span>
-              <span class="chat-meta-toggle">{{ chat.expandedTool[i + '-' + j] ? '收起 ▴' : '展开 ▾' }}</span>
+              <span v-if="m.toolResults?.[j]?.args && Object.keys(m.toolResults[j].args).length" class="terminal-args-inline">{{ fmtToolArgsBrief(m.toolResults[j].args) }}</span>
+              <span v-if="!toolResultReady(m, j)" class="terminal-status terminal-status-busy">{{ elapsedTool(m, j) }}</span>
+              <span v-else-if="m.toolResults?.[j]?.result?.success === false" class="terminal-status terminal-status-err">失败</span>
+              <span v-else class="terminal-status terminal-status-ok">完成</span>
+              <span v-if="toolResultReady(m, j)" class="chat-meta-toggle">{{ chat.expandedTool[i + '-' + j] ? '收起 ▴' : '展开 ▾' }}</span>
             </div>
-            <div v-if="chat.expandedTool[i + '-' + j] && m.toolResults?.[j]" class="chat-meta-body">
-              {{ JSON.stringify(m.toolResults[j].result, null, 2) }}
+            <div v-if="toolResultReady(m, j) && chat.expandedTool[i + '-' + j] && m.toolResults?.[j]" class="terminal-body">
+              <div class="terminal-line terminal-args"><span class="terminal-prompt">$</span> {{ tc.name }} <span class="terminal-args-json">{{ fmtToolArgs(m.toolResults[j].args) }}</span></div>
+              <div class="terminal-line terminal-output" :class="{ 'terminal-error': m.toolResults[j].result?.success === false }">
+                <pre>{{ JSON.stringify(m.toolResults[j].result, null, 2) }}</pre>
+              </div>
             </div>
           </div>
         </div>
@@ -218,7 +228,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useChatStore, type PendingFile } from '../stores/chatStore'
 import { useDataChanged } from '../composables/useDataChanged'
 import { knowledgeApi } from '../api/knowledge'
@@ -230,6 +240,7 @@ defineProps<{ compact?: boolean }>()
 
 const chat = useChatStore()
 const toast = useToast()
+const now = ref(Date.now()) // reactive clock — drives live elapsed-time display
 const chatBox = ref<HTMLElement | null>(null)
 const textareaRef = ref<HTMLTextAreaElement | null>(null)
 const fileInputRef = ref<HTMLInputElement | null>(null)
@@ -509,6 +520,39 @@ function openFileDir(filePath: string) {
   }
 }
 
+// ── Tool call display helpers ──
+
+function toolResultReady(m: any, j: number): boolean {
+  return m.toolResults?.[j]?.result !== null && m.toolResults?.[j]?.result !== undefined
+}
+function elapsedTool(m: any, j: number): string {
+  const startedAt = m.toolResults?.[j]?.startedAt as number | undefined
+  if (!startedAt) return '执行中…'
+  const sec = Math.round((now.value - startedAt) / 1000)
+  if (sec < 60) return `执行中… ${sec}s`
+  return `执行中… ${Math.floor(sec / 60)}m ${sec % 60}s`
+}
+function toolBlockClass(m: any, j: number) {
+  const r = m.toolResults?.[j]?.result
+  if (r === null || r === undefined) return 'terminal-running'
+  if (r?.success === false) return 'terminal-err'
+  return 'terminal-done'
+}
+function fmtToolArgs(args: any): string {
+  if (!args || Object.keys(args).length === 0) return ''
+  const s = JSON.stringify(args)
+  return s.length > 120 ? s.slice(0, 120) + '…' : s
+}
+function fmtToolArgsBrief(args: any): string {
+  if (!args || Object.keys(args).length === 0) return ''
+  const keys = Object.keys(args)
+  const firstKey = keys[0]
+  const val = JSON.stringify(args[firstKey])
+  const brief = `${firstKey}=${val.length > 30 ? val.slice(0, 30) + '…' : val}`
+  if (keys.length > 1) return brief + ` +${keys.length - 1}`
+  return brief
+}
+
 // ── Tool emojis / quips ──
 
 const TOOL_EMOJI: Record<string, string> = {
@@ -546,7 +590,7 @@ const busyMsg = computed(() => {
       // Find the first tool call without a result yet
       const results = m.toolResults || []
       for (const tc of m.toolCalls) {
-        const done = results.some(r => r.name === tc.name)
+        const done = results.some(r => r.name === tc.name && r.result !== null && r.result !== undefined)
         if (!done) return toolQuip(tc.name)
       }
       return '正在处理工具结果...'
@@ -564,6 +608,7 @@ watch(() => {
 }, () => nextTick(() => scrollChat()))
 watch(() => chat.busy, (val) => { if (val) { atBottom.value = true; nextTick(() => scrollChat()) } })
 
+const _nowTimer = setInterval(() => { now.value = Date.now() }, 1000)
 onMounted(() => {
   chat.loadConfig()
   chat.loadSkills()
@@ -571,6 +616,7 @@ onMounted(() => {
   chat.loadSessions()
   nextTick(() => scrollChat())
 })
+onBeforeUnmount(() => { clearInterval(_nowTimer) })
 
 // Reload agent list when personas change elsewhere (e.g. management page).
 useDataChanged('agents:changed', () => { chat.loadAgents() })
@@ -728,7 +774,7 @@ function scrollChat() {
 
 /* ── Context bar ── */
 .chat-ctx-wrap {
-  display: flex; flex-direction: column; align-items: center; gap: 2px; flex-shrink: 0;
+  display: flex; flex-direction: row; align-items: center; gap: 5px; flex-shrink: 0;
 }
 .chat-ctx-bar {
   width: 64px; height: 4px; border-radius: 2px;
@@ -740,7 +786,7 @@ function scrollChat() {
 }
 .ctx-warn .chat-ctx-fill { background: #d29922; }
 .ctx-critical .chat-ctx-fill { background: var(--danger); }
-.chat-ctx-label { font-size: 8px; color: var(--text-tertiary); font-family: var(--font-mono); line-height: 1; }
+.chat-ctx-label { font-size: 9px; color: var(--text-tertiary); font-family: var(--font-mono); line-height: 1; min-width: 28px; }
 
 /* ── Input section (textarea + bottom bar) ── */
 .chat-input-section {
@@ -1053,20 +1099,55 @@ function scrollChat() {
 /* Meta blocks (thinking + tool calls) */
 .chat-meta-block { width: 100%; border-radius: var(--radius-sm); overflow: hidden; }
 .chat-meta-think { border-left: 3px solid rgba(180,150,60,0.5); background: rgba(180,150,60,0.04); }
-.chat-meta-tool  { border-left: 3px solid rgba(140,140,150,0.5); background: rgba(140,140,150,0.04); }
-.chat-meta-tool-err { border-left-color: var(--danger); background: rgba(255,80,80,0.04); }
+/* ── Tool call terminal blocks ── */
+.chat-meta-tool  { border-left: 3px solid rgba(140,140,150,0.5); background: rgba(140,140,150,0.04); transition: border-color 0.3s, box-shadow 0.3s; }
+.chat-meta-tool.terminal-running { border-left-color: rgba(180,150,60,0.7); box-shadow: 0 0 8px rgba(180,150,60,0.08); }
+.chat-meta-tool.terminal-done   { border-left-color: rgba(80,180,120,0.6); }
+.chat-meta-tool.terminal-err    { border-left-color: var(--danger); background: rgba(255,80,80,0.04); }
 .chat-meta-head { display: flex; align-items: center; gap: 6px; padding: 6px 10px; cursor: pointer; user-select: none; transition: background 0.12s; }
 .chat-meta-think .chat-meta-head:hover { background: rgba(180,150,60,0.08); }
 .chat-meta-tool .chat-meta-head:hover { background: rgba(140,140,150,0.08); }
 .chat-meta-label { font-size: 11px; font-weight: 500; }
 .chat-meta-think .chat-meta-label { color: rgba(180,150,60,0.85); }
 .chat-meta-tool .chat-meta-label { color: rgba(180,180,190,0.85); }
+
+.terminal-label { width: 18px; display: inline-flex; align-items: center; justify-content: center; }
+.terminal-spin { animation: spin 1s linear infinite; display: inline-block; color: rgba(180,150,60,0.9); }
+@keyframes spin { to { transform: rotate(360deg); } }
+.chat-meta-tool.terminal-running .chat-meta-label { color: rgba(210,180,60,0.95); }
+
+.terminal-status { font-size: 10px; font-weight: 500; padding: 1px 6px; border-radius: 3px; flex-shrink: 0; }
+.terminal-status-busy { background: rgba(180,150,60,0.12); color: rgba(210,180,60,0.9); }
+.terminal-status-ok   { background: rgba(80,180,120,0.1); color: rgba(100,200,140,0.85); }
+.terminal-status-err  { background: rgba(255,80,80,0.1); color: rgba(255,120,120,0.85); }
+
 .chat-meta-tool-name {
   font-size: 10px; padding: 1px 6px; border-radius: 3px;
   background: rgba(140,140,150,0.12); color: rgba(180,180,190,0.7);
   font-family: var(--font-mono); flex-shrink: 0;
 }
+.terminal-args-inline {
+  font-size: 10px; color: rgba(160,180,210,0.55); flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-mono);
+}
 .chat-meta-toggle { font-size: 10px; opacity: 0.5; flex-shrink: 0; margin-left: auto; }
+
+/* ── Terminal body ── */
+.terminal-body {
+  padding: 6px 10px 8px; background: rgba(0,0,0,0.25);
+  border-top: 1px solid rgba(255,255,255,0.04);
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.6;
+  color: rgba(200,200,210,0.85); user-select: text; max-height: 320px; overflow-y: auto;
+}
+.terminal-line { padding: 2px 0; white-space: pre-wrap; word-break: break-word; }
+.terminal-prompt { color: rgba(100,200,140,0.8); margin-right: 6px; font-weight: 600; }
+.terminal-args { color: rgba(180,180,200,0.7); }
+.terminal-args-json { color: rgba(140,160,200,0.65); font-size: 10px; }
+.terminal-output { color: rgba(200,200,210,0.8); }
+.terminal-output pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+.terminal-error .terminal-output { color: rgba(255,140,140,0.85); }
+
 .chat-meta-body { padding: 0 10px 8px; font-size: 11px; line-height: 1.55; color: var(--text-tertiary); white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow-y: auto; user-select: text; }
 .chat-tool-item-head { font-size: 10px; margin-bottom: 3px; font-family: var(--font-mono); }
 .tool-ok { color: var(--success); }

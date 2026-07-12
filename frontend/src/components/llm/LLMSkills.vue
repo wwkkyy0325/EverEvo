@@ -2,8 +2,11 @@
   <div class="llm-skills">
     <!-- Toolbar -->
     <div class="skill-toolbar">
-      <span class="skill-count">{{ skills.length }} 个能力 · {{ enabledCount }} 已启用 · {{ packageGroups.length }} 个包</span>
+      <span class="skill-count">{{ skills.length }} 个能力{{ showAllDomains ? ' (全部领域)' : '' }} · {{ enabledCount }} 已启用 · {{ packageGroups.length }} 个包</span>
       <div class="skill-toolbar-actions">
+        <label style="font-size:11px;color:var(--text-tertiary);cursor:pointer;display:flex;align-items:center;gap:4px;margin-right:4px;">
+          <input type="checkbox" v-model="showAllDomains" style="cursor:pointer;" /> 全部领域
+        </label>
         <button class="btn btn-sm" @click="doRefreshSkills">刷新</button>
         <button class="btn btn-sm btn-primary" @click="openSkillDialog()">新建 Skill</button>
         <button class="btn btn-sm btn-primary" @click="openMarket">浏览市场</button>
@@ -221,8 +224,10 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, watch, nextTick } from 'vue'
 import { useToast } from '../../composables/useToast'
+import { useActiveLibrary } from '../../composables/useActiveLibrary'
 import { skillsApi } from '../../api/skills'
 import { mcpApi } from '../../api/mcp'
+import { memoryApi } from '../../api/memory'
 import type { Skill, SkillPackage } from '../../api/skills'
 
 const toast = useToast()
@@ -236,8 +241,19 @@ const props = withDefaults(defineProps<{ iconPalette?: string[] }>(), {
 const defaultIconPalette = ['◎','◈','◇','□','◉','○','●','◆','◊','△','▲','▽','☆','★','⊕','⊗','⬡','⬢','☰','☷']
 const emit = defineEmits<{ (e: 'skills-changed'): void; (e: 'mcp-servers-changed'): void }>()
 
+// ── Domain ──
+const { activeLibraryId } = useActiveLibrary()
+const showAllDomains = ref(false)
+const domainLibs = ref<{ id: string; name: string }[]>([])
+
 // ── State ──
-const skills = ref<Skill[]>([])
+const allSkills = ref<Skill[]>([])
+// Filtered skills: either all, or only those matching active library (plus global skills with empty libraryId).
+const skills = computed(() => {
+  const list = allSkills.value || []
+  if (showAllDomains.value || !activeLibraryId.value) return list
+  return list.filter(s => !s.libraryId || s.libraryId === activeLibraryId.value)
+})
 const expandedPkg = reactive<Record<string, boolean>>({})
 
 // New package
@@ -269,6 +285,7 @@ const editingSkill = ref<any>(null)
 const skillForm = reactive<Record<string, any>>({
   name:'', title:'', description:'', category:'', package:'', icon:'',
   toolsText:'', resourcesText:'', systemPrompt:'', mcpTools:[] as string[],
+  libraryId: '',
 })
 const showSkillIconPick = ref(false)
 const skillMsg = ref(''); const skillOk = ref(false)
@@ -315,7 +332,8 @@ onMounted(() => { loadSkills(); loadMCPServers() })
 
 // ── Skills CRUD ──
 async function loadSkills() {
-  try { skills.value = await skillsApi.list() || [] } catch (e: any) { t('error','加载失败',e.message||e) }
+  try { allSkills.value = await skillsApi.list() || [] } catch (e: any) { t('error','加载失败',e.message||e) }
+  try { domainLibs.value = (await memoryApi.libraryList()) || [] } catch (_) {}
 }
 function doRefreshSkills() { loadSkills(); emit('skills-changed') }
 async function toggleSkill(s: Skill) {
@@ -471,7 +489,7 @@ async function openSkillDialog(skill?: any) {
     skillForm.category = ''; skillForm.package = 'everevo'
     skillForm.icon = ''
     skillForm.toolsText = ''; skillForm.resourcesText = ''; skillForm.systemPrompt = ''
-    skillForm.mcpTools = []
+    skillForm.mcpTools = []; skillForm.libraryId = activeLibraryId.value
   }
   skillDialog.value = true
 }
@@ -486,6 +504,7 @@ async function doSaveSkill() {
     resources: skillForm.resourcesText.split('\n').map((s:string)=>s.trim()).filter(Boolean),
     prompts: [], systemPrompt: skillForm.systemPrompt.trim(),
     mcpTools: skillForm.mcpTools || [],
+    libraryId: skillForm.libraryId || activeLibraryId.value,
     enabled: editingSkill.value ? editingSkill.value.enabled : true,
   })
   saving.value = true

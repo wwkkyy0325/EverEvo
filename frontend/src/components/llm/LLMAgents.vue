@@ -3,10 +3,13 @@
     <!-- Toolbar -->
     <div class="agents-toolbar glass-panel">
       <div class="agents-toolbar-info">
-        <span class="agents-count">{{ agents.length }} 个 Agent</span>
+        <span class="agents-count">{{ agents.length }} 个 Agent{{ showAllDomains ? ' (全部领域)' : '' }}</span>
         <span class="agents-hint">本地智能体人格 —— 主 Agent 可 <code>agent_create</code> / <code>agent_run</code> 调用，也可在聊天中切换</span>
       </div>
       <div class="agents-toolbar-actions">
+        <label style="font-size:11px;color:var(--text-tertiary);cursor:pointer;display:flex;align-items:center;gap:4px;margin-right:4px;">
+          <input type="checkbox" v-model="showAllDomains" style="cursor:pointer;" /> 全部领域
+        </label>
         <button class="btn btn-sm" @click="loadAgents">刷新</button>
         <button class="btn btn-sm btn-primary" @click="openCreate">+ 新建 Agent</button>
       </div>
@@ -155,6 +158,7 @@
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useToast } from '../../composables/useToast'
 import { useDataChanged } from '../../composables/useDataChanged'
+import { useActiveLibrary } from '../../composables/useActiveLibrary'
 import { agentsApi } from '../../api/agents'
 import { providersApi } from '../../api/providers'
 import { skillsApi } from '../../api/skills'
@@ -169,7 +173,14 @@ function t(type: string, title: string, desc?: string) {
 interface SkillLike { name: string; title: string; icon?: string }
 interface ProviderLike { id: string; name: string; model: string; enabled?: boolean }
 
-const agents = ref<LocalAgent[]>([])
+const { activeLibraryId } = useActiveLibrary()
+const allAgents = ref<LocalAgent[]>([])
+const showAllDomains = ref(false)
+const agents = computed(() => {
+  const list = allAgents.value || []
+  if (showAllDomains.value || !activeLibraryId.value) return list
+  return list.filter(a => !a.libraryId || a.libraryId === activeLibraryId.value || a.isDefault)
+})
 const providers = ref<ProviderLike[]>([])
 const skills = ref<SkillLike[]>([])
 
@@ -215,7 +226,7 @@ onMounted(async () => {
 useDataChanged('agents:changed', () => { loadAgents() })
 
 async function loadAgents() {
-  try { agents.value = await agentsApi.list() || [] } catch (e: any) {
+  try { allAgents.value = await agentsApi.list() || [] } catch (e: any) {
     t('error', '加载失败', e.message || String(e))
   }
 }
@@ -273,7 +284,7 @@ function resetForm() {
 function openCreate(libraryId = '') {
   editing.value = null
   resetForm()
-  if (libraryId) form.libraryId = libraryId
+  form.libraryId = libraryId || activeLibraryId.value
   showIconPick.value = false
   dialogOpen.value = true
 }

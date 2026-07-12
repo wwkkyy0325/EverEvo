@@ -92,15 +92,17 @@ func (a *App) scheduler() {
 				return
 			}
 			dir := a.memoryStore.EmbeddingModelDir()
+			// Land extracted facts in the SAME library as the conversation that
+			// produced them (the most recent turn's workspace), NOT always core.
+			libID := a.memoryStore.LastTurnLibrary()
 			for _, f := range facts {
 				if strings.TrimSpace(f.Content) == "" { continue }
 				if f.Importance == "high" {
-					a.memoryStore.AddUserFact(uuid.NewString(), f.Category, f.Content, f.Category, "high", "extract")
+					a.memoryStore.AddUserFact(uuid.NewString(), f.Category, f.Content, f.Category, "high", "extract", libID)
 					continue
 				}
 				if dir != "" {
 					emb, _ := rag.EmbedQuery(dir, f.Content)
-					libID, _ := a.memoryStore.DefaultLibrary()
 					a.memoryStore.AddFactMemory(uuid.NewString(), f.Content, f.Category, f.Importance, libID, "[]", emb)
 				}
 			}

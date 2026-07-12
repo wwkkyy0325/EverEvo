@@ -52,6 +52,18 @@ func (a *App) GetUserConfigDir() string {
 	return config.UserConfigDir()
 }
 
+// GetDataDir returns the root data directory (%APPDATA%/EverEvo/).
+func (a *App) GetDataDir() string {
+	dir, _ := storage.DataDir()
+	return dir
+}
+
+// GetModelsDir returns the model storage directory.
+func (a *App) GetModelsDir() string {
+	dir, _ := storage.ModelsDir()
+	return dir
+}
+
 // GetBackendDownloadURL returns the platform-specific download URL for a backend.
 // variant: "" = default (CPU), "cuda" = CUDA build.
 func (a *App) GetBackendDownloadURL(key string, mirror string, variant string) string {
@@ -333,4 +345,103 @@ func (a *App) WebSearch(query string) ([]map[string]any, error) {
 		})
 	}
 	return results, nil
+}
+
+// ─── Web Fetch (URL → text) ─────────────────────────────────
+
+// WebFetch fetches a URL and extracts usable text content, stripping HTML when
+// detected. Optional prompt extracts a targeted excerpt (2KB around matching
+// keywords). Limits response body to 256KB.
+func (a *App) WebFetch(url, prompt string) (map[string]any, error) {
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	client := httpclient.New(15 * time.Second)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s failed: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	raw := string(body)
+	contentType := resp.Header.Get("Content-Type")
+	text := raw
+	if strings.HasPrefix(strings.TrimSpace(raw), "<") || strings.Contains(contentType, "text/html") {
+		text = stripHTML(raw)
+	}
+	text = strings.TrimSpace(text)
+
+	result := map[string]any{
+		"url":         url,
+		"contentType": contentType,
+		"text":        text,
+		"size":        len(body),
+	}
+	if prompt != "" {
+		result["excerpt"] = excerptAround(text, prompt, 2048)
+	}
+	return result, nil
+}
+
+// stripHTML removes all HTML tags and decodes common entities.
+func stripHTML(s string) string {
+	// Remove scripts, styles, comments
+	re := regexp.MustCompile(`(?is)<(script|style|noscript)[^>]*>.*?</\1>`)
+	s = re.ReplaceAllString(s, "")
+	re = regexp.MustCompile(`<!--.*?-->`)
+	s = re.ReplaceAllString(s, "")
+	// Strip all remaining tags
+	re = regexp.MustCompile(`<[^>]*>`)
+	s = re.ReplaceAllString(s, " ")
+	// Decode common entities
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	s = strings.ReplaceAll(s, "&lt;", "<")
+	s = strings.ReplaceAll(s, "&gt;", ">")
+	s = strings.ReplaceAll(s, "&quot;", `"`)
+	s = strings.ReplaceAll(s, "&#39;", "'")
+	s = strings.ReplaceAll(s, "&nbsp;", " ")
+	// Collapse whitespace
+	re = regexp.MustCompile(`\s+`)
+	s = re.ReplaceAllString(s, " ")
+	return strings.TrimSpace(s)
+}
+
+// excerptAround returns up to maxLen characters around the first occurrence of
+// any keyword in text.
+func excerptAround(text, prompt string, maxLen int) string {
+	if text == "" || prompt == "" {
+		return ""
+	}
+	words := strings.Fields(prompt)
+	best := strings.Index(strings.ToLower(text), strings.ToLower(prompt))
+	if best == -1 {
+		for _, w := range words {
+			if pos := strings.Index(strings.ToLower(text), strings.ToLower(w)); pos >= 0 {
+				best = pos
+				break
+			}
+		}
+	}
+	if best == -1 {
+		if len(text) > maxLen {
+			return text[:maxLen] + "…"
+		}
+		return text
+	}
+	start := best - maxLen/2
+	if start < 0 {
+		start = 0
+	}
+	end := start + maxLen
+	if end > len(text) {
+		end = len(text)
+	}
+	out := text[start:end]
+	if start > 0 {
+		out = "…" + out
+	}
+	if end < len(text) {
+		out = out + "…"
+	}
+	return out
 }

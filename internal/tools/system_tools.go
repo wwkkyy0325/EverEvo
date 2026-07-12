@@ -126,4 +126,20 @@ func registerSystemTools() {
 			Required: []string{"query"},
 		},
 	})
+
+	// web_fetch — fetch a single URL and extract usable text content.
+	Register(&ToolDef{
+		Name:        "web_fetch",
+		Description: "获取指定 URL 的网页内容并提取纯文本。用于阅读文章、文档、API 响应等。限制 256KB。可选 prompt 参数可提取相关摘录。",
+		Category:    "system",
+		Annotations: &ToolAnnotations{ReadOnlyHint: true},
+		Parameters: &ToolParams{
+			Type: "object",
+			Properties: map[string]ToolProp{
+				"url":    {Type: "string", Description: "要获取的网页 URL"},
+				"prompt": {Type: "string", Description: "可选：提取与提示相关的摘录（关键词附近 2KB）"},
+			},
+			Required: []string{"url"},
+		},
+	})
 }

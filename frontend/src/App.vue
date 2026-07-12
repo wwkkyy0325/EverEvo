@@ -27,6 +27,19 @@
         </nav>
 
         <div class="nav-sep"></div>
+        <!-- Domain Switcher -->
+        <div v-if="!sidebarCollapsed" class="domain-switcher">
+          <select v-model="activeLibraryId" class="domain-select" title="切换领域">
+            <option v-for="lib in domainLibs" :key="lib.id" :value="lib.id">
+              {{ lib.icon || '📚' }} {{ lib.name }}
+            </option>
+          </select>
+          <span class="domain-indicator" title="当前领域">{{ currentDomainIcon }} {{ currentDomainName }}</span>
+        </div>
+        <div v-else class="domain-collapsed" title="切换领域">
+          <span class="domain-collapsed-icon">{{ currentDomainIcon }}</span>
+        </div>
+        <div class="nav-sep"></div>
         <button class="nav-item chat-sidebar-toggle"
           :class="{ active: showChatPanel }"
           @click="showChatPanel = !showChatPanel"
@@ -90,13 +103,16 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import ToastContainer from './components/ToastContainer.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
 import AccountMenu from './components/AccountMenu.vue'
 import ChatPanel from './components/ChatPanel.vue'
 import { useDownloadStore } from './stores/downloadStore'
+import { useChatStore } from './stores/chatStore'
+import { useActiveLibrary } from './composables/useActiveLibrary'
+import { memoryApi } from './api/memory'
 
 import { systemApi } from './api/system'
 
@@ -113,6 +129,8 @@ const navItems = [
   { route: 'plugins', icon: '⊕', label: '插件' },
   { route: 'capability', icon: '◎', label: '大语言模型' },
   { route: 'workflow', icon: '⇢', label: '工作流' },
+  { route: 'workbench', icon: '⬡', label: '协同工作台' },
+  { route: 'activity', icon: '⌖', label: '活动历史' },
   { route: 'settings', icon: '⚙', label: '设置' },
 ]
 
@@ -124,6 +142,30 @@ function navigateTo(name: string) {
 
 // ── State ──
 const sidebarCollapsed = ref(false)
+
+// Domain library — shared across all components via useActiveLibrary.
+const { activeLibraryId } = useActiveLibrary()
+const domainLibs = ref<{ id: string; name: string; icon: string }[]>([])
+const currentDomainIcon = computed(() => domainLibs.value.find(l => l.id === activeLibraryId.value)?.icon || '📚')
+const currentDomainName = computed(() => domainLibs.value.find(l => l.id === activeLibraryId.value)?.name || '核心领域')
+
+async function loadDomainLibs() {
+  try { domainLibs.value = (await memoryApi.libraryList()) || [] }
+  catch (_) { domainLibs.value = [] }
+  // Validate restored domain ID — if it no longer exists, fall back to first.
+  if (activeLibraryId.value && !domainLibs.value.some(l => l.id === activeLibraryId.value)) {
+    activeLibraryId.value = ''
+  }
+  if (domainLibs.value.length && !activeLibraryId.value) {
+    activeLibraryId.value = domainLibs.value[0].id
+  }
+}
+
+// Watch domain switch — bump usage and notify.
+watch(activeLibraryId, (id) => {
+  if (id) memoryApi.libraryBumpUse(id)
+})
+
 const sysInfo = ref<any>(null)
 const dynInfo = ref<any>(null)
 let dynTimer: ReturnType<typeof setInterval> | null = null
@@ -165,6 +207,10 @@ function startStatusClose() { statusCloseTimer = setTimeout(() => { showStatus.v
 function cancelStatusClose() { if (statusCloseTimer) { clearTimeout(statusCloseTimer); statusCloseTimer = null } }
 // ── Lifecycle ──
 onMounted(() => {
+  loadDomainLibs()
+  // Eager-load chat sessions so conversation history survives restart
+  // regardless of whether the chat panel is visible.
+  try { useChatStore().loadSessions() } catch (_) {}
   refreshBackends()
   systemApi.getSysInfo().then((info: any) => { sysInfo.value = info }).catch(() => {})
   startDynPolling()
@@ -223,6 +269,14 @@ defineExpose({ showToast, showConfirm })
 .sidebar.collapsed .nav-badge { display: none; }
 .sidebar.collapsed .nav-item { justify-content: center; padding: 8px 0; gap: 0; }
 .sidebar.collapsed .nav-item.active::before { left: -6px; height: 18px; }
+/* Domain Switcher */
+.domain-switcher { padding: 0 4px; margin-bottom: 2px; }
+.domain-select { width: 100%; padding: 5px 24px 5px 8px !important; font-size: 11px !important; border-radius: 5px !important; }
+.domain-indicator { display: none; }
+.domain-collapsed { display: flex; justify-content: center; padding: 6px 0; cursor: pointer; }
+.domain-collapsed-icon { font-size: 15px; opacity: 0.8; transition: opacity var(--transition); }
+.domain-collapsed-icon:hover { opacity: 1; }
+
 .nav-badge { font-size: 11px; font-weight: 600; color: var(--accent); background: var(--bg-active); padding: 1px 7px; border-radius: 10px; line-height: 1.4; flex-shrink: 0; font-variant-numeric: tabular-nums; }
 .nav-sep { height: 1px; background: var(--border-subtle); margin: 6px 8px 4px; }
 .sidebar.collapsed .nav-sep { margin: 4px 6px 2px; }

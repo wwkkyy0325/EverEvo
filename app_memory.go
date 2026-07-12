@@ -153,10 +153,18 @@ func (a *App) MemoryMessageClear(sessionID string) error {
 
 // ─── Long-term semantic memory (P1.5) ─────────────────────────────
 
-// MemoryRecall runs a two-pass recall (turn + fact) for cross-session context.
-// Returns {turns:[{content,reply}], facts:[{content,category}]}; empty arrays
-// when no embedding model is bound or no memories exist.
+// MemoryRecall runs a two-pass recall scoped to the current conversation's
+// domain (inferred from the last turn). Kept at 2 args for Wails binding
+// compatibility with the frontend. Use MemoryRecallScoped to pass a library.
 func (a *App) MemoryRecall(query string, k int) (map[string]any, error) {
+	return a.MemoryRecallScoped(query, k, "")
+}
+
+// MemoryRecallScoped runs a two-pass recall (turn + fact) for cross-session
+// context. libraryID scopes the recall to a domain library ("" → infer from
+// last turn). Returns {turns,facts,graph,graphTrace,core}; empty arrays when
+// no embedding model is bound or no memories exist.
+func (a *App) MemoryRecallScoped(query string, k int, libraryID string) (map[string]any, error) {
 	empty := map[string]any{"turns": []any{}, "facts": []any{}, "graph": "", "graphTrace": map[string]any{"seedIds": []any{}, "edgeIds": []any{}}, "core": []any{}}
 	if a.memoryStore == nil || !a.memoryStore.HasVector() {
 		return empty, nil
@@ -172,14 +180,20 @@ func (a *App) MemoryRecall(query string, k int) (map[string]any, error) {
 	if err != nil {
 		return empty, fmt.Errorf("记忆查询嵌入失败: %w", err)
 	}
-	turns, facts, err := a.memoryStore.QueryMemory(emb, k)
+	// Resolve scope: explicit libraryID wins; otherwise infer from the most
+	// recent turn (the active conversation's domain).
+	if libraryID == "" {
+		libraryID = a.memoryStore.LastTurnLibrary()
+	}
+	// from other domains don't leak into this chat's context.
+	turns, facts, err := a.memoryStore.QueryMemory(emb, k, libraryID)
 	if err != nil {
 		return empty, err
 	}
 	// P2: graph retrieval reuses the same embedding (no double-embedding).
-	graph, _ := a.memoryStore.RetrieveGraph(emb, k)
-	graphTrace := a.memoryStore.RetrieveGraphTrace(emb, k)
-	core, _ := a.memoryStore.ListUserFacts()
+	graph, _ := a.memoryStore.RetrieveGraph(emb, k, libraryID)
+	graphTrace := a.memoryStore.RetrieveGraphTrace(emb, k, libraryID)
+	core, _ := a.memoryStore.ListUserFacts(libraryID)
 	if core == nil {
 		core = []memory.UserFact{}
 	}
@@ -254,7 +268,7 @@ func (a *App) MemoryRecallExperience(workspaceID string, k int) ([]memory.Experi
 	return items, nil
 }
 
-func (a *App) MemoryRemember(userText, reply, sessionID string) error {
+func (a *App) MemoryRemember(userText, reply, sessionID, libraryID string) error {
 	if a.memoryStore == nil || userText == "" || reply == "" {
 		return nil
 	}
@@ -270,7 +284,7 @@ func (a *App) MemoryRemember(userText, reply, sessionID string) error {
 		}
 	}
 	itemID := uuid.NewString()
-	if err := a.memoryStore.AddTurnMemory(itemID, userText, reply, sessionID, emb); err != nil {
+	if err := a.memoryStore.AddTurnMemory(itemID, userText, reply, sessionID, libraryID, emb); err != nil {
 		return err
 	}
 	// Session summarization — runs async, never blocks the chat loop.
@@ -285,7 +299,7 @@ func (a *App) MemoryStatus(libraryID string) (map[string]any, error) {
 		return map[string]any{"bound": false, "modelDir": "", "turnCount": 0, "factCount": 0, "nodeCount": 0, "edgeCount": 0}, nil
 	}
 	dir := a.memoryStore.EmbeddingModelDir()
-	tc, fc := a.memoryStore.CountMemory()
+	tc, fc := a.memoryStore.CountMemory(libraryID)
 	return map[string]any{
 		"bound":     dir != "" && a.memoryStore.HasVector(),
 		"modelDir":  dir,
@@ -296,15 +310,16 @@ func (a *App) MemoryStatus(libraryID string) (map[string]any, error) {
 	}, nil
 }
 
-// MemoryList returns the k most recent memory items (turn + fact) for the UI.
-func (a *App) MemoryList(k int) ([]memory.MemoryItem, error) {
+// MemoryList returns the k most recent memory items (turn + fact) for the UI,
+// optionally scoped to libraryID.
+func (a *App) MemoryList(k int, libraryID string) ([]memory.MemoryItem, error) {
 	if a.memoryStore == nil {
 		return []memory.MemoryItem{}, nil
 	}
 	if k <= 0 {
 		k = 20
 	}
-	list, err := a.memoryStore.ListMemoryItems(k)
+	list, err := a.memoryStore.ListMemoryItems(k, libraryID)
 	if err != nil {
 		return nil, err
 	}
@@ -553,12 +568,20 @@ func memoryPolicyFor(availRAM, diskFreeGB float64) memory.MemoryPolicy {
 	return p
 }
 
-// MemoryCoreList returns permanent core-memory facts (identity/preferences/constraints).
+// MemoryCoreList returns permanent core-memory facts (global view, all libraries).
+// Kept no-arg for Wails binding compatibility. Use MemoryCoreListByLibrary for
+// per-library scoping.
 func (a *App) MemoryCoreList() ([]memory.UserFact, error) {
+	return a.MemoryCoreListByLibrary("")
+}
+
+// MemoryCoreListByLibrary returns core-memory facts scoped to a domain library.
+// libraryID "" → all (global); otherwise scoped to that library + legacy 'default'.
+func (a *App) MemoryCoreListByLibrary(libraryID string) ([]memory.UserFact, error) {
 	if a.memoryStore == nil {
 		return []memory.UserFact{}, nil
 	}
-	facts, err := a.memoryStore.ListUserFacts()
+	facts, err := a.memoryStore.ListUserFacts(libraryID)
 	if err != nil {
 		return nil, err
 	}
@@ -573,7 +596,7 @@ func (a *App) MemoryCoreAdd(key, value, category string) error {
 	if a.memoryStore == nil {
 		return fmt.Errorf("记忆库未就绪")
 	}
-	if err := a.memoryStore.AddUserFact(uuid.NewString(), key, value, category, "high", "manual"); err != nil {
+	if err := a.memoryStore.AddUserFact(uuid.NewString(), key, value, category, "high", "manual", ""); err != nil {
 		return err
 	}
 	a.emitChanged("memory:changed", "core", "")
@@ -609,11 +632,11 @@ func (a *App) LibraryList() ([]map[string]any, error) {
 }
 
 // LibraryCreate adds a domain library and returns its id.
-func (a *App) LibraryCreate(name, description string, autoCreated bool) (string, error) {
+func (a *App) LibraryCreate(name, description, icon string, autoCreated bool) (string, error) {
 	if a.memoryStore == nil {
 		return "", fmt.Errorf("记忆库未就绪")
 	}
-	libID, err := a.memoryStore.LibraryCreate(name, description, autoCreated)
+	libID, err := a.memoryStore.LibraryCreate(name, description, icon, autoCreated)
 	if err != nil {
 		return "", err
 	}
@@ -625,6 +648,14 @@ func (a *App) LibraryCreate(name, description string, autoCreated bool) (string,
 		}
 	}
 	return libID, nil
+}
+
+// LibraryUpdate updates a domain library's mutable fields.
+func (a *App) LibraryUpdate(id, name, description, icon string) error {
+	if a.memoryStore == nil {
+		return fmt.Errorf("记忆库未就绪")
+	}
+	return a.memoryStore.LibraryUpdate(id, name, description, icon)
 }
 
 // LibraryDelete removes a domain library. Caller should cascade data first.
@@ -703,9 +734,11 @@ func (a *App) runMemorySweep() {
 		return
 	}
 	sweep := func() {
+		changed := false
 		// TTL expiry
 		if ids, err := a.memoryStore.SweepExpiredPolicy(); err == nil && len(ids) > 0 {
 			log.Printf("[memory] TTL 清理 %d 条过期情节记忆", len(ids))
+			changed = true
 		}
 		// P8: soft cap — compress low-importance items via LLM summary before trimming.
 		a.maybeCompress()
@@ -713,6 +746,11 @@ func (a *App) runMemorySweep() {
 		policy := a.memoryStore.Policy()
 		if n, err := a.memoryStore.TrimMemoryCapacity(policy.ItemCap); err == nil && n > 0 {
 			log.Printf("[memory] 容量裁剪 %d 条低优先级记忆 (上限 %d)", n, policy.ItemCap)
+			changed = true
+		}
+		// Notify frontend so counts don't silently drift after background cleanup.
+		if changed {
+			a.emitChanged("memory:changed", "sweep", "")
 		}
 	}
 	sweep() // boot
@@ -744,7 +782,7 @@ func (a *App) resolveOrCreateLibrary(name string) string {
 			return lib.ID
 		}
 	}
-	id, err := a.memoryStore.LibraryCreate(name, "由 AI 自动发现", true)
+	id, err := a.memoryStore.LibraryCreate(name, "由 AI 自动发现", "🤖", true)
 	if err != nil {
 		log.Printf("[memory] 自动创建领域库失败: %v", err)
 		return "default"
@@ -762,7 +800,7 @@ func (a *App) maybeExtractFacts() {
 	if a.memoryStore == nil {
 		return
 	}
-	tc, _ := a.memoryStore.CountMemory()
+	tc, _ := a.memoryStore.CountMemory("")
 	if tc == 0 || tc%factExtractEvery != 0 {
 		return
 	}
@@ -818,7 +856,7 @@ func (a *App) maybeExtractFacts() {
 		}
 		if f.Importance == "high" {
 			// Core: identity/preference/constraint — permanent, no decay/TTL.
-			if err := a.memoryStore.AddUserFact(uuid.NewString(), f.Category, f.Content, f.Category, "high", "extract"); err != nil {
+			if err := a.memoryStore.AddUserFact(uuid.NewString(), f.Category, f.Content, f.Category, "high", "extract", libID); err != nil {
 				log.Printf("[memory] 核心事实写入失败: %v", err)
 			}
 			continue
@@ -884,10 +922,10 @@ func (a *App) runDreamPipeline() {
 	now := time.Now().UnixMilli()
 
 	// ── Light: scan recent turns, extract candidates ──
-	tc, fc := a.memoryStore.CountMemory()
+	tc, fc := a.memoryStore.CountMemory("")
 	log.Printf("[dream] Light: 扫描 %d turns + %d facts", tc, fc)
 	// Collect recent memory items as light candidates.
-	items, _ := a.memoryStore.ListMemoryItems(30)
+	items, _ := a.memoryStore.ListMemoryItems(30, "")
 	lightCount := 0
 	for _, it := range items {
 		id := fmt.Sprintf("dc_%x_%s", now, it.ID[:8])
@@ -1006,7 +1044,7 @@ func (a *App) maybeLinkEntities(dir string) {
 		return
 	}
 	// Only run every 10th fact extraction cycle to avoid excessive LLM calls.
-	tc, _ := a.memoryStore.CountMemory()
+	tc, _ := a.memoryStore.CountMemory("")
 	if tc%50 != 0 || tc == 0 {
 		return
 	}
@@ -1046,13 +1084,13 @@ func (a *App) maybeReflect() {
 	if dir == "" {
 		return
 	}
-	tc, _ := a.memoryStore.CountMemory()
+	tc, _ := a.memoryStore.CountMemory("")
 	if tc < reflectEvery || tc%reflectEvery != 0 {
 		return
 	}
 	log.Printf("[reflect] 开始反思蒸馏 (第 %d 轮)", tc)
 
-	items, _ := a.memoryStore.ListMemoryItems(16)
+	items, _ := a.memoryStore.ListMemoryItems(16, "")
 	var dialogue strings.Builder
 	for _, it := range items {
 		if it.Kind == "turn" {
@@ -1162,7 +1200,7 @@ func (a *App) maybeCompress() {
 		return
 	}
 	// Only compress when above 80% of hard cap.
-	tc, _ := a.memoryStore.CountMemory()
+	tc, _ := a.memoryStore.CountMemory("")
 	policy := a.memoryStore.Policy()
 	if tc < policy.ItemCap*80/100 {
 		return

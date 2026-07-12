@@ -93,9 +93,24 @@ func (a *App) DuplicateWorkflow(id string) (workflow.WorkflowDef, error) {
 
 // ─── Workflow Execution ──────────────────────────────────────────
 
+// maxWorkflowExecDepth caps nested ExecuteWorkflow invocations. Even though
+// the Tool node now blocks workflow_execute, this is a defense-in-depth guard
+// against any future re-entry path.
+const maxWorkflowExecDepth = 4
+
+// workflowExecDepth tracks the current nesting depth per call chain. Keys are
+// ephemeral; the counter is bumped on entry and decremented on exit.
+var workflowExecDepth int
+
 // ExecuteWorkflow runs a workflow and returns the execution ID.
 func (a *App) ExecuteWorkflow(id string, inputs map[string]any) (string, error) {
 	if a.workflowManager == nil { return "", fmt.Errorf("workflow manager not ready") }
+	if workflowExecDepth >= maxWorkflowExecDepth {
+		return "", fmt.Errorf("workflow 执行嵌套过深 (>%d)，已中止以防递归", maxWorkflowExecDepth)
+	}
+	workflowExecDepth++
+	defer func() { workflowExecDepth-- }()
+
 	wf, err := a.workflowManager.Get(id)
 	if err != nil { return "", err }
 
@@ -103,7 +118,7 @@ func (a *App) ExecuteWorkflow(id string, inputs map[string]any) (string, error) 
 	llmAdapter := &workflowLLMAdapter{app: a}
 	toolAdapter := &workflowToolAdapter{app: a}
 	toolProvAdapter := &workflowToolProviderAdapter{app: a}
-	emitter := &workflowEventEmitter{ctx: a.ctx} // Use shutdown-safe ctx
+	emitter := &workflowEventEmitter{ctx: a.ctx, app: a} // Use shutdown-safe ctx
 
 	eng := workflow.NewEngine(wf, llmAdapter, toolAdapter, toolProvAdapter, emitter, a.workflowManager)
 	eng.SetAgentRunner(&workflowAgentAdapter{app: a})
@@ -182,10 +197,22 @@ func (a *workflowToolProviderAdapter) GetToolDefs(names []string) []workflow.Too
 	return out
 }
 
-type workflowEventEmitter struct{ ctx context.Context }
+type workflowEventEmitter struct {
+	ctx context.Context
+	app *App
+}
 
 func (e *workflowEventEmitter) Emit(event string, data any) {
+	// Keep the raw wf-* Wails emit for backward compatibility (no current listener,
+	// but cheap to retain), and bridge into the unified collab:event stream +
+	// activity log so the workbench (single subscription) and history see workflow
+	// activity alongside agent/plan/blackboard events.
 	wailsRuntime.EventsEmit(e.ctx, event, data)
+	if e.app != nil {
+		if m, ok := data.(map[string]any); ok {
+			e.app.bridgeWorkflowEvent(event, m)
+		}
+	}
 }
 
 // workflowAgentAdapter lets the workflow engine run a local Agent persona.

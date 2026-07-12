@@ -28,8 +28,13 @@
         </div>
         <div class="arow">
           <span class="arow-label">数据目录</span>
-          <code class="arow-path">{{ dataDir }}</code>
-          <button v-if="exeDir" class="btn btn-icon" title="打开所在目录" @click="openDir(dataDir)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
+          <code class="arow-path">{{ dataDir || '—' }}</code>
+          <button v-if="dataDir" class="btn btn-icon" title="打开所在目录" @click="openDir(dataDir)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
+        </div>
+        <div class="arow">
+          <span class="arow-label">模型目录</span>
+          <code class="arow-path">{{ modelsDir || '—' }}</code>
+          <button v-if="modelsDir" class="btn btn-icon" title="打开所在目录" @click="openDir(modelsDir)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
         </div>
       </div>
     </section>
@@ -159,6 +164,8 @@ const props = defineProps<{
 const status = ref({ version: '0.1.0' })
 const exeDir = ref('')
 const userConfigDir = ref('')
+const dataDir = ref('')
+const modelsDir = ref('')
 const hasShortcut = ref(false)
 const backends = ref<any[]>([])
 const mirrorList = ref<any[]>([])
@@ -233,16 +240,19 @@ async function doClearProxy() {
   proxySaving.value = false
 }
 
-const dataDir = computed(() => exeDir.value ? exeDir.value + '\\data' : '—')
+// dataDir / modelsDir are now refs loaded from backend — see loadDataDir/loadModelsDir
 
 onMounted(async () => {
   await Promise.all([
-    loadExeDir(), loadUserConfigDir(), loadShortcut(), loadBackends(), loadPlatform(), loadMirrors(), loadProxy()
+    loadExeDir(), loadUserConfigDir(), loadDataDir(), loadModelsDir(),
+    loadShortcut(), loadBackends(), loadPlatform(), loadMirrors(), loadProxy()
   ])
 })
 
 async function loadExeDir() { try { exeDir.value = await systemApi.getExeDir() } catch (_) {} }
 async function loadUserConfigDir() { try { userConfigDir.value = await systemApi.getUserConfigDir() } catch (_) {} }
+async function loadDataDir() { try { dataDir.value = await systemApi.getDataDir() } catch (_) {} }
+async function loadModelsDir() { try { modelsDir.value = await systemApi.getModelsDir() } catch (_) {} }
 async function loadShortcut() { try { hasShortcut.value = await systemApi.hasStartMenuShortcut() } catch (_) {} }
 function openDir(p: string) { if (p) systemApi.openDir(p).catch(() => {}) }
 async function doPin() {

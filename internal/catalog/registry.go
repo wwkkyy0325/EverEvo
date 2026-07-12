@@ -8,6 +8,9 @@ var Sources = map[string]Source{
 
 // AggregatedSearch 多源并发搜索，去重合并。
 func AggregatedSearch(query string, limit int, filter *SearchFilter) *SearchResult {
+	if filter == nil {
+		filter = &SearchFilter{}
+	}
 	type srcResult struct {
 		source string
 		result *SearchResult
@@ -15,8 +18,16 @@ func AggregatedSearch(query string, limit int, filter *SearchFilter) *SearchResu
 	ch := make(chan srcResult, len(Sources))
 	for key, src := range Sources {
 		go func(k string, s Source) {
+			// Recover from panics in any single source so one buggy source
+			// can't crash the whole aggregate (a nil-deref in HF Search did
+			// exactly this before the in-source nil guard was added).
+			defer func() {
+				if r := recover(); r != nil {
+					ch <- srcResult{source: k, result: &SearchResult{}}
+				}
+			}()
 			r, err := s.Search(query, limit, filter)
-			if err != nil {
+			if err != nil || r == nil {
 				r = &SearchResult{}
 			}
 			ch <- srcResult{source: k, result: r}

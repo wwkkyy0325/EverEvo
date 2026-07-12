@@ -21,6 +21,7 @@ type ServerConfig struct {
 	Args      []string `json:"args,omitempty"`    // stdio: arguments
 	Env       []string `json:"env,omitempty"`     // stdio: extra env (KEY=VALUE)
 	URL       string   `json:"url,omitempty"`     // http: base URL
+	LibraryID string   `json:"libraryId,omitempty"` // domain library this server belongs to
 
 	// Runtime state (not persisted)
 	Status    string `json:"status"` // "disconnected" | "connecting" | "connected" | "error"

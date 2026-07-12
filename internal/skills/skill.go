@@ -30,6 +30,7 @@ type Skill struct {
 	MCPServers  []string `json:"mcpServers,omitempty"` // dependent MCP server IDs
 	MCPTools    []string `json:"mcpTools,omitempty"`   // external tool names to include
 	SystemPrompt string  `json:"systemPrompt,omitempty"` // custom system prompt for this skill
+	LibraryID   string  `json:"libraryId,omitempty"`   // domain library this skill belongs to
 }
 
 // builtinSkills defines the default skills bundled with EverEvo.
@@ -132,6 +133,13 @@ var builtinSkills = []Skill{
 			Category: "browser", Package: "everevo", Enabled: true,
 			Tools: []string{"shell_exec"},
 			SystemPrompt: "你是浏览器自动化专家。使用 shell_exec 调用 playwright-cli 控制浏览器。安装: npm install -g @playwright/cli",
+		},
+		{
+			Name: "taskboard", Title: "任务板", Icon: "📋",
+			Description: "跨对话追踪任务进度：列出、添加、更新、管理任务步骤",
+			Category: "taskboard", Package: "everevo", Enabled: true,
+			Tools:     []string{"taskboard_list", "taskboard_add", "taskboard_update", "taskboard_steps"},
+			SystemPrompt: "你是任务板管理员。当前任务板中的任务会跨对话追踪。用 taskboard_list 查看进度，taskboard_add 添加新任务，完成后用 taskboard_update status=done 标记。在每次回复末尾简要提醒未完成的任务。",
 		},
 }
 
@@ -259,11 +267,48 @@ func (m *Manager) Save() error {
 // List returns all skills.
 func (m *Manager) List() []Skill { return m.Skills }
 
+// ListByLibrary returns skills filtered by library ID. Empty libraryID returns
+// all skills (backward-compatible).
+func (m *Manager) ListByLibrary(libraryID string) []Skill {
+	if libraryID == "" {
+		return m.Skills
+	}
+	var out []Skill
+	for _, s := range m.Skills {
+		if s.LibraryID == libraryID {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // ListEnabled returns only enabled skills.
 func (m *Manager) ListEnabled() []Skill {
 	var out []Skill
 	for _, s := range m.Skills {
 		if s.Enabled {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// ListEnabledByLibrary returns enabled skills filtered by library ID.
+// When libraryID is empty, returns only global skills (empty LibraryID) —
+// domain-scoped skills are the domain path, global skills the global path.
+func (m *Manager) ListEnabledByLibrary(libraryID string) []Skill {
+	var out []Skill
+	for _, s := range m.Skills {
+		if !s.Enabled {
+			continue
+		}
+		if libraryID == "" {
+			// Global-only: skills with no library binding.
+			if s.LibraryID == "" {
+				out = append(out, s)
+			}
+		} else if s.LibraryID == libraryID || s.LibraryID == "" {
+			// Domain-scoped: skills matching this domain + global skills.
 			out = append(out, s)
 		}
 	}
@@ -363,6 +408,30 @@ func (m *Manager) Import(data json.RawMessage) error {
 		}
 	}
 	return m.Save()
+}
+
+// EnsureLibraryIDs backfills empty or invalid LibraryID fields with the given
+// default ID and saves. Safe to call at startup after the memory store is ready.
+// validIDs is the set of current domain library IDs from the memory store.
+func (m *Manager) EnsureLibraryIDs(defaultLibraryID string, validIDs []string) error {
+	valid := make(map[string]bool, len(validIDs))
+	for _, id := range validIDs {
+		valid[id] = true
+	}
+	changed := false
+	for i := range m.Skills {
+		if m.Skills[i].LibraryID == "" || !valid[m.Skills[i].LibraryID] {
+			if m.Skills[i].LibraryID != "" {
+				log.Printf("[skills] Skill %q 的 libraryId %q 无效，回填为默认领域", m.Skills[i].Name, m.Skills[i].LibraryID)
+			}
+			m.Skills[i].LibraryID = defaultLibraryID
+			changed = true
+		}
+	}
+	if changed {
+		return m.Save()
+	}
+	return nil
 }
 
 // GetEnabledTools returns the union of all tools from enabled skills.

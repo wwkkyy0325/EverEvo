@@ -32,9 +32,33 @@ func Verify(source, credential string) *UserInfo {
 	return &UserInfo{Valid: false, Reason: "不支持的平台"}
 }
 
+// looksLikeToken distinguishes an API access token from a cookie string. A
+// cookie is one or more key=value pairs (often "; "-separated); a token
+// (hf_xxx, ms-...) is a bare opaque string with no "=" or ";". Tokens must be
+// sent as "Authorization: Bearer", cookies via the Cookie header — sending a
+// token as a cookie is the classic "401 invalid" cause.
+func looksLikeToken(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "hf_") || strings.HasPrefix(s, "ms-") {
+		return true
+	}
+	return !strings.Contains(s, "=") && !strings.Contains(s, ";")
+}
+
 func verifyHF(credential string) *UserInfo {
+	credential = strings.TrimSpace(credential)
+	if credential == "" {
+		return &UserInfo{Valid: false, Reason: "凭证为空"}
+	}
 	req, _ := http.NewRequest("GET", "https://huggingface.co/api/whoami-v2", nil)
-	req.Header.Set("Cookie", credential)
+	if looksLikeToken(credential) {
+		req.Header.Set("Authorization", "Bearer "+credential)
+	} else {
+		req.Header.Set("Cookie", credential)
+	}
 	req.Header.Set("User-Agent", "everevo/0.1")
 	resp, err := verifyClient.Do(req)
 	if err != nil {
@@ -43,7 +67,7 @@ func verifyHF(credential string) *UserInfo {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return &UserInfo{Valid: false, Reason: "凭证已过期或无效"}
+		return &UserInfo{Valid: false, Reason: "凭证被拒绝（401/403）：已过期、额度耗尽或格式不符"}
 	}
 	if resp.StatusCode != 200 {
 		return &UserInfo{Valid: false, Reason: fmt.Sprintf("HTTP %d", resp.StatusCode)}
@@ -58,7 +82,51 @@ func verifyHF(credential string) *UserInfo {
 	return &UserInfo{Valid: true, Username: body.Name}
 }
 
+// verifyMSByToken is a best-effort identity check for ModelScope access tokens
+// via the API (Authorization: Bearer). The response shape is parsed loosely; if
+// anything is off the caller falls back to the cookie-scrape path.
+func verifyMSByToken(token string) *UserInfo {
+	req, _ := http.NewRequest("GET", "https://www.modelscope.cn/api/v1/user/info", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "everevo/0.1")
+	resp, err := verifyClient.Do(req)
+	if err != nil {
+		return &UserInfo{Valid: false, Reason: "网络错误: " + err.Error()}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return &UserInfo{Valid: false, Reason: fmt.Sprintf("HTTP %d", resp.StatusCode)}
+	}
+	var body struct {
+		Data struct {
+			Username string `json:"Username"`
+			NickName string `json:"NickName"`
+		} `json:"Data"`
+	}
+	if err := readJSON(resp, &body); err != nil {
+		return &UserInfo{Valid: false, Reason: "解析响应失败"}
+	}
+	name := body.Data.Username
+	if name == "" {
+		name = body.Data.NickName
+	}
+	return &UserInfo{Valid: true, Username: name}
+}
+
 func verifyMS(credential string) *UserInfo {
+	credential = strings.TrimSpace(credential)
+	if credential == "" {
+		return &UserInfo{Valid: false, Reason: "凭证为空"}
+	}
+	// Access tokens (from the 访问令牌 page) authenticate via the API as Bearer;
+	// cookies authenticate the web session. Try the matching path, fall back to
+	// the cookie scrape so a token-shaped input can't regress below today's
+	// cookie behavior.
+	if looksLikeToken(credential) {
+		if info := verifyMSByToken(credential); info != nil && info.Valid {
+			return info
+		}
+	}
 	// 不跟随重定向：访问需要登录的页面，302→login 说明未登录
 	client := httpclient.New(8 * time.Second)
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
@@ -75,11 +143,11 @@ func verifyMS(credential string) *UserInfo {
 	if resp.StatusCode == 301 || resp.StatusCode == 302 {
 		loc := resp.Header.Get("Location")
 		if strings.Contains(loc, "login") || strings.Contains(loc, "signin") {
-			return &UserInfo{Valid: false, Reason: "凭证已过期或无效"}
+			return &UserInfo{Valid: false, Reason: "凭证被拒绝（重定向到登录页）：Cookie 已过期或填入的是 Token（需改用 Cookie）"}
 		}
 	}
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return &UserInfo{Valid: false, Reason: "凭证已过期或无效"}
+		return &UserInfo{Valid: false, Reason: "凭证被拒绝（401/403）"}
 	}
 	if resp.StatusCode == 200 {
 		// 已登录，从 HTML 提取用户名

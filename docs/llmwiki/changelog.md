@@ -2,6 +2,92 @@
 
 > Append-only record of meaningful changes to EverEvo. Newest entry at the top.
 
+## 2026-07-11 — 领域即容器 v2 实施（Phase 0–5）
+
+**Why:** 领域化是将 `domain_libraries` 从松散标签升格为架构级强制容器的核心重构。基于 [domain-refactor-v2.md](tasks/domain-refactor-v2.md) 的完整设计，结合 25+ 篇学术论文（CoALA/MemGPT/IsolateGPT/PC-RAG等）的业界共识。
+
+**Changes — Phase 0: Schema & Data Foundation**
+- *Memory store*: 新增 `ListLibraryIDs()` / `IsValidLibrary(id)` 验证方法；新增 `DedupUserFacts()` 按 key 去重核心记忆（保留最新 + 合并 access_count）
+- *RAG store*: `BackfillLibraryIDs` 增强为修复悬挂引用（如孤儿 `lib_18c0842c0b947f70`）——不仅补空值，也修复指向不存在 domain 的 LibraryID
+- *MCP manager*: `BackfillLibraryIDs` 同步增强，接收 `validIDs` 参数修复悬挂引用
+- *Agent manager*: `EnsureLibraryIDs` 同步增强，接收 `validIDs` 参数修复悬挂引用
+- *Skill manager*: `EnsureLibraryIDs` 同步增强，接收 `validIDs` 参数修复悬挂引用
+- *app.go startup*: 回填链路统一传递 `validIDs`；新增 `DedupUserFacts()` 调用
+
+**Changes — Phase 1: Backend API Hardening**
+- *app.go*: 新增 `validateLibraryID(id)` 和 `resolveLibraryID(id)` 共享校验/解析 helpers
+- *app_agents.go*: `CreateAgent` 强制校验 `agent.LibraryID` 非空且存在
+- *app_mcp.go*: `AddMCPServer` 强制校验 `cfg.LibraryID` 非空且存在；补 `fmt` import
+- *app_knowledge.go*: `CreateKnowledgeBase` 强制校验 `libraryID` 非空且存在
+- *app_skills.go*: `CreateSkill` 校验 `LibraryID`（空 = 全局 Skill，允许；非空必须存在）；补 `fmt` import
+
+**Changes — Phase 2: Frontend Domain-First Navigation**
+- *App.vue*: 侧边栏新增领域切换器（`<select>` 下拉 + 折叠态图标）。使用 `useActiveLibrary` 共享状态。`onMounted` 加载领域列表。新增 domain switcher CSS
+- *LLMMCP.vue*: 新增领域过滤 —— `mcpServers` 从 `ref` 改为 `computed`（按 `activeLibraryId` 过滤）；新增 "显示全部领域" checkbox；服务器卡片显示领域标签；`saveMCPServer` cfg 自动注入 `libraryId`
+
+**Changes — Phase 3: System Prompt Dynamic Generation**
+- *app_agent_exec.go*: 新增 `BuildDomainSystemPrompt(domainId)` —— 生成领域限定的系统提示片段（该领域的 Agent + Skill + MCP Server）
+- *chatStore.ts*: 全局模式和 Agent 模式均自动注入领域上下文（`BuildDomainSystemPrompt` 调用）。记忆/知识库/Wiki/经验召回已使用 `activeLibraryId`
+
+**Phase 4 & 5:**
+- 记忆去重在 Phase 0 中完成（`DedupAllFacts` + `DedupUserFacts`）
+- Skill 领域过滤在 Phase 3 中完成（`ListEnabledByLibrary` → `BuildDomainSystemPrompt`）
+- 全量测试通过：10 个测试包 0 失败
+
+**设计要点:**
+- **零破坏向后兼容**：空 `libraryId` → 默认领域；旧数据自动回填
+- **不改存储格式**：agents.json / skills.json / mcp_servers.json 保持现有结构
+- **学术支撑**：30 条参考文献覆盖 DDD / CoALA / MemGPT / IsolateGPT / PC-RAG / Security Knowledge Dilution 等
+
+**结果:** `go build ./...` ✓ / `go test ./internal/...` (10 packages) ✓ / `vue-tsc --noEmit`（改动文件 0 新错误，预存错误未增加）
+
+## 2026-07-11 — 领域即容器重构提案
+
+**Why:** 系统诊断发现 6 类问题源于同一根因：`domain_libraries` 只是记忆系统的内部分类标签而非架构级容器。KB/Agent 有 `LibraryID` 但不强制，MCP Server/Skill 完全无领域归属，Wiki 底层隔离但前端不体现。用户看到 18 个"领域"、2 个 KB 中一个悬挂引用、3 个 MCP Server 全部全局、3 套 Skill 体系互不同步、50+ 条重复核心记忆。
+
+**提案:** [tasks/domain-refactor.md](tasks/domain-refactor.md) — 5 阶段重构：
+- Phase 0: Schema 加固（补 FK/default/missing columns）
+- Phase 1: 后端 API 强制 libraryId（所有创建 API 必传，列表 API 支持过滤）
+- Phase 2: 前端领域优先导航（DomainPanel 为中心，各子系统默认按领域过滤）
+- Phase 3: Skill 体系统一（持久化到 DB + 绑定领域 + 三套合并）
+- Phase 4: 记忆去重增强 + 领域隔离
+- Phase 5: 数据迁移清理（修复悬挂引用、回填空字段）
+
+**设计决策:** 默认领域策略（空 libraryId = 默认领域，向后兼容）；跨域访问需显式声明；保留 LLM 自动发现领域但标记 🤖。
+
+## 2026-07-11 — 协同工作台全观测 + 统一活动日志 + 历史回放
+
+**Why:** 工作台要成为「观察 AI 工作的窗口」。痛点：agent 卡片显示 ID 非 name；无 agent.start/message/tool.call 事件；工作流走独立 Wails 总线前端无人订阅、执行完即驱逐；collab 事件纯内存重启即失。
+
+**核心设计**：两套事件总线（collab bus + workflow Wails）统一汇聚到**单一 `collab:event` 流 + 单一 SQLite 日志**。
+
+**Changes:**
+- *统一活动日志*：[store.go](internal/memory/store.go) `activity_log` 表 + `LogActivity`/`ListActivity`（ID 用 ts+原子 seq 保唯一，空结果返回 `[]` 非 null）。
+- *ActivityLogger 汇聚*：新 [app_activity.go](app_activity.go) `recordActivity`（buffered 1024 队列 + 单写 goroutine，满则丢最旧护总线）+ `mapEventToActivity`（topic→kind/summary）+ `agentDisplayName`（ID→name）+ `bridgeWorkflowEvent` + `App.ListActivity` 绑定；[app.go](app.go) forward 回调挂钩（单一汇聚点）+ 启动写 goroutine。
+- *工作流桥接*：[app_workflow.go](app_workflow.go) `workflowEventEmitter` 加 `app`，Emit 时桥接 `wf-*` 进 `collab:event` + 日志（保留原直发）。
+- *补事件*：[app_collab.go](app_collab.go) 异步派发发 `agent.<id>.start`；[app_agent_exec.go](app_agent_exec.go) 每次 CallTool 后发 `tool.<agentID>.call`（agent 间通信由 dispatch/message 工具的 tool.call 派生，不单独发 message）。
+- *工作台实时全观测*：[CollabWorkbench.vue](frontend/src/components/CollabWorkbench.vue) 重写——agent 节点显示 **name + 当前活动**（task/调用工具/写黑板）、工作流节点（wf-exec-start/node-*/done + 进度）、**通信动画边**（tool.call 派 dispatch/message）、工具调用进事件流（TOOL）、agent/工作流点开抽屉看明细；name 映射复用 `agentsApi.list()`。
+- *历史回放*：新 [ActivityHistory.vue](frontend/src/components/ActivityHistory.vue) + 路由 `/activity` + 导航「活动历史」——过滤（类型/来源/条数）+ 会话运行卡片回放（按 sessionId）+ 时间线 + payload 详情 + 实时追加。
+
+**核实/限制**：工作流历史走活动日志（Manager 执行完即驱逐）；工作台运行中途挂载会漏早期工作流事件（事件驱动）；聊天面板工具调用未归属（缺 caller 上下文，后续）。日志写异步满则丢最旧。
+
+**测试**：`internal/memory` `TestLogAndListActivity`；`go build .` + `go vet` + `vue-tsc`（改动文件零错误）。运行期需桌面端实测（collab_create/dispatch → 工作台 name/活动/通信；workflow_execute → 工作流节点；重启 → 活动历史回放）。
+
+## 2026-07-11 — 手动修复清单批次（#5/#6/#7/#8/#10）
+
+**Why:** 用户列出 10 项手动修复，#1-3 已修。逐一代码核实剩余 7 项：#4（memoryStore 顺序）、#9（MCP 自启动）工作树中已正确实现 → 不动；另 5 项为真实 bug/增强。
+
+**Changes:**
+- *#7 graph_list nodes null*：[app_tools_control.go](app_tools_control.go) `hGraphList` 把 `result["nodes"].([]any)` 改为 `[]memory.GraphNode`（Go 禁止 typed slice→`[]any` 断言，原断言恒 nil → LLM 工具路径 nodes 恒 null）。补 `everevo/internal/memory` import。前端 Wails 绑定一直正常。
+- *#8 episodic fact 去重*：[store.go](internal/memory/store.go) `AddFactMemory` 插入前加精确（SQL COUNT 同 content）+ 语义（`QueryFacts` cosine ≥ `factDedupThreshold=0.90`）去重，对齐 `AddUserFact` 已有的 key+value 去重。修 LLM 每 N 轮重复抽取导致同一事实存 3-5 次。
+- *#10 token 验证用 Bearer*：[verify.go](internal/auth/verify.go) `looksLikeToken`（`hf_`/`ms-` 前缀或无 `=`/`;`）判别；`verifyHF` 对 token 发 `Authorization: Bearer`（原 Cookie 路径保留）；`verifyMS` 新增 `verifyMSByToken`（API Bearer，best-effort）失败回退 Cookie 抓取（不回归）。Reason 细化（网络错误 / 被拒绝 / 过期 / HTTP %d）。
+- *#5 插件健康检查致命化*：[app_plugins.go](app_plugins.go) `StartPlugin` 健康检查失败 → `host.Stop` + 返回错误（原仅 log），RPC 故障即时暴露而非 30s 超时。
+- *#6 攻略预置 EverEvo 使用指南*：[internal/guides/](internal/guides/) `//go:embed userguides/*.md`（6 篇：快速上手/市场下载/工具箱/AI能力/记忆知识/工作流）+ 新增内部 `local` 源类型 `syncLocal`（幂等写出 embed 文件）+ `NewManager` 返回 `(mgr, seeded)` 首次 seed `everevo` 源；[app.go](app.go) seeded 时 `go SyncAll()`。不依赖外网、不 404。
+
+**核实未改：** #4（app.go:281 memoryStore 在 collab restore :305 之前，guard 有效）、#9（app.go:362-369 自动启动 MCP + 持久化端口，server.go 正确）。
+
+**测试：** `internal/memory`（`TestAddFactMemoryExactDedup` / `SemanticDedup` / `TestListNodesEmptyMarshalsToArray`）、`internal/guides`（`TestEmbeddedUserGuidesPresent` / `TestDefaultEverEvoSource`）。`go build .` + 改动包 `go vet` 全通过。
+
 ## 2026-07-09 — P9: Python Portable 基础设施
 
 - **Python 检测**: 三层优先级——便携 Python (AppData) > Conda > 系统 PATH

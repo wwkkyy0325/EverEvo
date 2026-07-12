@@ -45,8 +45,11 @@ func (a *App) getRagStore() (*rag.Store, error) {
 }
 
 // CreateKnowledgeBase 创建新的知识库。modelDir 是嵌入模型的本地目录。
-// libraryID 将 KB 绑定到指定领域库（空字符串 = 全局）。
+// libraryID 将 KB 绑定到指定领域库（必传，不可为空）。
 func (a *App) CreateKnowledgeBase(name, modelDir, libraryID string) (rag.KnowledgeBase, error) {
+	if err := a.validateLibraryID(libraryID); err != nil {
+		return rag.KnowledgeBase{}, fmt.Errorf("创建知识库失败: %w", err)
+	}
 	store, err := a.getRagStore()
 	if err != nil {
 		return rag.KnowledgeBase{}, err

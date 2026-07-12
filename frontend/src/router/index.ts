@@ -54,6 +54,26 @@ const router = createRouter({
       name: 'settings',
       component: () => import('@/components/SettingsPanel.vue'),
     },
+    {
+      path: '/zones',
+      name: 'zones',
+      component: () => import('@/components/ZonePanel.vue'),
+    },
+    {
+      path: '/collab',
+      name: 'collab',
+      component: () => import('@/components/CollabPanel.vue'),
+    },
+    {
+      path: '/workbench',
+      name: 'workbench',
+      component: () => import('@/components/CollabWorkbench.vue'),
+    },
+    {
+      path: '/activity',
+      name: 'activity',
+      component: () => import('@/components/ActivityHistory.vue'),
+    },
   ],
 })
 

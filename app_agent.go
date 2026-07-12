@@ -166,15 +166,47 @@ func (a *App) GetAgentTask(agentID, taskID string) (*a2a.Task, error) {
 
 // ─── A2A Task Executor (internal) ────────────────────────────────
 
-// executeA2ATask is the TaskExecutor implementation that calls the LLM chat system.
+// composeA2ATaskText extracts the last user-role text from an A2A message
+// stream and folds in prior turns as light context, producing a single task
+// string for runAgentLoop (which expects one user message).
+func composeA2ATaskText(messages []a2a.Message) string {
+	var lastUser string
+	for _, m := range messages {
+		if m.Role == "user" {
+			for _, p := range m.Parts {
+				if p.Kind == "text" && p.Text != "" {
+					lastUser = p.Text
+				}
+			}
+		}
+	}
+	return lastUser
+}
+
+// executeA2ATask is the TaskExecutor implementation. An inbound A2A task is
+// routed through the local CORE agent persona (runAgentLoop) when available,
+// so the peer is answered by the real Evo identity — with its tools and
+// domain library — instead of a generic system-prompted LLM call. Falls back
+// to the legacy ChatProxy path if no agent manager / core agent is ready.
 func (a *App) executeA2ATask(ctx context.Context, messages []a2a.Message) (string, error) {
 	if len(messages) == 0 {
 		return "", fmt.Errorf("no messages to process")
 	}
 
-	// Convert A2A messages to OpenAI-format messages.
-	// Prepend a system prompt so the LLM knows it is acting as an A2A agent —
-	// otherwise peer messages arrive with no framing or identity.
+	// Prefer the core agent persona for inbound tasks.
+	if a.agentManager != nil {
+		if libID, err := a.memoryStore.DefaultLibrary(); err == nil && libID != "" {
+			if core, err := a.agentManager.GetCoreAgent(libID); err == nil && core != nil {
+				// Compose the task text from the last user-role message.
+				task := composeA2ATaskText(messages)
+				if task != "" {
+					return a.runAgentLoop(ctx, core, task)
+				}
+			}
+		}
+	}
+
+	// ── Legacy fallback: generic system-prompted ChatProxy ──
 	agentName := a.cfg.LLM.A2AConfig.Name
 	if agentName == "" {
 		agentName = "EverEvo Agent"
@@ -325,7 +357,7 @@ func (a *App) initA2AManager() {
 		DefaultOutputModes: []string{"text"},
 	}
 
-	dataDir, err := storage.DataDir()
+	dataDir, err := storage.AppDataDir()
 	if err != nil {
 		log.Printf("[agent] failed to get data dir: %v", err)
 		return

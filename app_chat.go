@@ -170,6 +170,7 @@ func (a *App) resolveExtractionProvider() (*config.LLMProvider, error) {
 // ChatProxy proxies the LLM chat request through the Go backend to avoid
 // CORS / fetch issues in the Wails WebView. Returns the normalized response.
 func (a *App) ChatProxy(messagesJSON json.RawMessage, toolsJSON json.RawMessage) (map[string]any, error) {
+	messagesJSON = a.injectTaskBoard(messagesJSON)
 	p, err := a.resolveActiveProvider()
 	if err != nil {
 		log.Printf("[chat] ChatProxy called activeID=%s providers=%d", a.cfg.LLM.ActiveProvider, len(a.cfg.LLM.Providers))
@@ -395,7 +396,18 @@ func (a *App) ChatStreamCancel(streamID string) {
 
 // The frontend must register EventsOn listeners BEFORE calling this method.
 func (a *App) ChatStream(streamID string, messagesJSON json.RawMessage, toolsJSON json.RawMessage, thinkEffort string) {
+	messagesJSON = a.injectTaskBoard(messagesJSON)
 	go func() {
+		// Recover from any panic during SSE parsing/provider resolution so the
+		// frontend always gets a terminal event — otherwise a malformed chunk
+		// (e.g. unexpected tool_calls shape from a small local model) crashes
+		// this goroutine silently and the chat hangs forever.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[chat] stream=%s PANIC recovered: %v", streamID, r)
+				wailsRuntime.EventsEmit(a.ctx, "chat-err-"+streamID, map[string]any{"error": fmt.Sprintf("内部错误（解析中断）: %v", r)})
+			}
+		}()
 		// Create a cancellable context for this stream.
 		streamCtx, streamCancel := context.WithCancel(a.chatCtx)
 		a.streamCancelMu.Lock()
@@ -434,7 +446,14 @@ func (a *App) ChatStream(streamID string, messagesJSON json.RawMessage, toolsJSO
 // Agent persona that overrides the provider/model or sets temperature/maxTokens.
 // Pass temperature < 0 to omit it (use provider default) and maxTokens <= 0 to omit.
 func (a *App) ChatStreamAs(streamID string, messagesJSON json.RawMessage, toolsJSON json.RawMessage, providerId, model string, temperature float64, maxTokens int, thinkEffort string) {
+	messagesJSON = a.injectTaskBoard(messagesJSON)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[chat] stream=%s PANIC recovered: %v", streamID, r)
+				wailsRuntime.EventsEmit(a.ctx, "chat-err-"+streamID, map[string]any{"error": fmt.Sprintf("内部错误（解析中断）: %v", r)})
+			}
+		}()
 		streamCtx, streamCancel := context.WithCancel(a.chatCtx)
 		a.streamCancelMu.Lock()
 		if a.streamCancels == nil { a.streamCancels = make(map[string]context.CancelFunc) }
@@ -713,6 +732,9 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
+				if err != io.EOF {
+					log.Printf("[chat] stream=%s SSE read error: %v", streamID, err)
+				}
 				break
 			}
 			line = strings.TrimSpace(line)
@@ -753,7 +775,14 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 			if tcs, ok := delta["tool_calls"].([]any); ok {
 				for _, tc := range tcs {
 					tcm, _ := tc.(map[string]any)
-					idx := int(tcm["index"].(float64))
+					if tcm == nil {
+						continue
+					}
+					// index is optional in some providers' chunks — default 0.
+					idx := 0
+					if iv, ok := tcm["index"].(float64); ok {
+						idx = int(iv)
+					}
 					for len(toolCalls) <= idx {
 						toolCalls = append(toolCalls, map[string]any{
 							"id": "", "type": "function",
@@ -784,6 +813,14 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 
 	if len(toolCalls) > 0 {
 		result["tool_calls"] = toolCalls
+	}
+	// Diagnostic: surface empty/short responses (common when a small local
+	// model's context window is overloaded — it returns 200 + empty SSE).
+	contentLen := len(result["content"].(string))
+	if contentLen == 0 && len(toolCalls) == 0 {
+		log.Printf("[chat] stream=%s WARNING: empty response (0 content, 0 tool_calls, %d lines) — likely context overflow on the model", streamID, lineCount)
+	} else {
+		log.Printf("[chat] stream=%s SSE done: %d chars, %d tool_calls", streamID, contentLen, len(toolCalls))
 	}
 	return map[string]any{"choices": []any{map[string]any{"message": result}}}, nil
 }

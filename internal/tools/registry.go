@@ -104,6 +104,10 @@ func RegisterAll() {
 	registerA2ATools()
 	registerAgentTools()
 	registerAppControlTools()
+	registerZoneTools()
+	registerCollabTools()
+	registerPlanTools()
+	registerTaskBoardTools()
 }
 
 // ─── helpers ────────────────────────────────────────────────────

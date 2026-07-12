@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -41,6 +42,10 @@ func GetNodeExecutor(t NodeType) (NodeExecutor, bool) {
 		return executeAgent, true
 	case NodeOutput:
 		return executeOutput, true
+	case NodeParallel:
+		return executeParallel, true
+	case NodeMap:
+		return executeMap, true
 	default:
 		return nil, false
 	}
@@ -208,6 +213,15 @@ func executeTool(eng *Engine, node *WorkflowNode) (any, error) {
 		return nil, fmt.Errorf("toolName is required")
 	}
 
+	// Block orchestration / dangerous tools to prevent unbounded recursion and
+	// privilege escalation from a workflow Tool node. A workflow must not be able
+	// to spawn another workflow (workflow_execute), delegate to agents that
+	// themselves recurse (agent_run), rewrite its own definition (workflow_*),
+	// or invoke destructive system tools (shell_exec/evolve_swap/zone_*).
+	if isWorkflowBlockedTool(toolName) {
+		return nil, fmt.Errorf("工具节点禁止调用编排/危险工具: %s", toolName)
+	}
+
 	rawParams := getMap(node.Config, "params")
 	params, err := ResolveMap(rawParams, eng.nodeOutputs)
 	if err != nil {
@@ -298,6 +312,14 @@ func executeLoop(eng *Engine, node *WorkflowNode) (any, error) {
 	maxIter := 100
 	if n, ok := getInt(node.Config, "maxIterations"); ok {
 		maxIter = n
+	}
+	// Hard cap to prevent context/memory explosion from LLM-authored loops.
+	const loopHardCap = 100
+	if maxIter > loopHardCap {
+		maxIter = loopHardCap
+	}
+	if maxIter <= 0 {
+		maxIter = 1
 	}
 
 	raw, err := ResolveExpression(sourceExpr, eng.nodeOutputs)
@@ -404,6 +426,193 @@ func executeAgent(eng *Engine, node *WorkflowNode) (any, error) {
 		"content": text,
 		"raw":     text,
 	}, nil
+}
+
+// parallelConcurrency caps how many branches/items run at once.
+const parallelConcurrency = 4
+
+// executeParallel runs multiple named branches concurrently, gathering each
+// branch's final sub-node output into a map keyed by alias. Each branch gets
+// an isolated copy of nodeOutputs (snapshot at dispatch) so concurrent writes
+// don't race; results are merged back after all branches finish.
+//
+// config:
+//
+//	branches: [{ nodeId, alias }]   alias defaults to nodeId
+//	failFast: bool (default false — collect all, including errors)
+func executeParallel(eng *Engine, node *WorkflowNode) (any, error) {
+	rawBranches, _ := node.Config["branches"].([]any)
+	if len(rawBranches) == 0 {
+		return nil, fmt.Errorf("parallel node requires branches")
+	}
+	type branch struct {
+		nodeID string
+		alias  string
+	}
+	var branches []branch
+	for _, rb := range rawBranches {
+		m, ok := rb.(map[string]any)
+		if !ok {
+			continue
+		}
+		nid, _ := m["nodeId"].(string)
+		alias, _ := m["alias"].(string)
+		if alias == "" {
+			alias = nid
+		}
+		if nid != "" {
+			branches = append(branches, branch{nodeID: nid, alias: alias})
+		}
+	}
+	if len(branches) == 0 {
+		return nil, fmt.Errorf("parallel node has no valid branches")
+	}
+
+	results := make(map[string]any, len(branches))
+	errs := make(map[string]string, len(branches))
+	var mu sync.Mutex
+	sem := make(chan struct{}, parallelConcurrency)
+	var wg sync.WaitGroup
+
+	for _, b := range branches {
+		wg.Add(1)
+		go func(br branch) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			subNode := eng.wf.NodeByID(br.nodeID)
+			if subNode == nil {
+				mu.Lock()
+				errs[br.alias] = "node not found: " + br.nodeID
+				mu.Unlock()
+				return
+			}
+			eng.emitNodeStart(br.nodeID, subNode.Title)
+			output, err := eng.executeNode(subNode)
+			mu.Lock()
+			if err != nil {
+				errs[br.alias] = err.Error()
+			} else {
+				results[br.alias] = output
+			}
+			mu.Unlock()
+			if err == nil {
+				// Publish to nodeOutputs under the sub-node ID so downstream
+				// nodes can reference it (write under the engine lock).
+				eng.SetOutput(br.nodeID, output)
+			}
+			if err != nil {
+				eng.emitNodeError(br.nodeID, subNode.Title, err.Error())
+			} else {
+				eng.emitNodeDone(br.nodeID, subNode.Title, output)
+			}
+		}(b)
+	}
+	wg.Wait()
+
+	out := map[string]any{"results": results}
+	if len(errs) > 0 {
+		out["errors"] = errs
+	}
+	return out, nil
+}
+
+// executeMap runs a sub-graph concurrently over each element of an array.
+// It is the concurrent counterpart of executeLoop. Each iteration gets an
+// isolated nodeOutputs snapshot seeded with the item variable; per-iteration
+// results are collected into an output array.
+//
+// config:
+//
+//	sourceExpression: template resolving to an array
+//	itemVariable: name for the current item (default "item")
+//	subNodeIDs: sub-graph node IDs to run per item
+//	concurrency: optional cap (default 4)
+func executeMap(eng *Engine, node *WorkflowNode) (any, error) {
+	sourceExpr := getString(node.Config, "sourceExpression")
+	itemVar := getString(node.Config, "itemVariable")
+	if itemVar == "" {
+		itemVar = "item"
+	}
+	subIDs := getStringSlice(node.Config, "subNodeIDs")
+	if len(subIDs) == 0 {
+		return nil, fmt.Errorf("map node requires subNodeIDs")
+	}
+
+	raw, err := ResolveExpression(sourceExpr, eng.nodeOutputs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve source: %w", err)
+	}
+	if s, ok := raw.(string); ok {
+		var parsed any
+		if json.Unmarshal([]byte(s), &parsed) == nil {
+			raw = parsed
+		}
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("source is not an array: %T", raw)
+	}
+
+	conc := parallelConcurrency
+	if n, ok := getInt(node.Config, "concurrency"); ok && n > 0 && n < conc {
+		conc = n
+	}
+
+	subSet := make(map[string]bool, len(subIDs))
+	for _, id := range subIDs {
+		subSet[id] = true
+	}
+	subOrder := filterTopo(eng.topoOrder, subSet)
+
+	type iterResult struct {
+		index  int
+		output map[string]any
+		err    string
+	}
+	results := make([]map[string]any, len(arr))
+	sem := make(chan struct{}, conc)
+	var wg sync.WaitGroup
+
+	for i, item := range arr {
+		wg.Add(1)
+		go func(idx int, it any) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			// Isolated per-iteration view: snapshot + inject item.
+			iterView := eng.SnapshotOutputs()
+			iterView[itemVar] = it
+
+			iterOut := map[string]any{"index": idx, itemVar: it}
+			eng.WithOutputs(iterView, func() {
+				for _, nid := range subOrder {
+					subNode := eng.wf.NodeByID(nid)
+					if subNode == nil {
+						continue
+					}
+					output, err := eng.executeNode(subNode)
+					if err != nil {
+						results[idx] = map[string]any{"index": idx, "error": err.Error()}
+						return
+					}
+					iterView[nid] = output
+					iterOut[nid] = output
+				}
+				results[idx] = iterOut
+			})
+		}(i, item)
+	}
+	wg.Wait()
+
+	// Flatten to a plain slice for downstream consumption.
+	out := make([]any, len(results))
+	for i, r := range results {
+		out[i] = r
+	}
+	return out, nil
 }
 
 func executeOutput(eng *Engine, node *WorkflowNode) (any, error) {

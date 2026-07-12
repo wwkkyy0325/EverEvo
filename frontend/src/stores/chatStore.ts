@@ -28,6 +28,7 @@ interface ToolResultEntry {
   name: string
   args: Record<string, unknown>
   result: ToolCallResult
+  startedAt?: number   // ms timestamp; set on placeholder, kept for elapsed display
 }
 
 interface ToolCall {
@@ -92,6 +93,106 @@ interface StreamDoneData {
 /** Stream error event data */
 interface StreamErrorData { error?: string }
 
+/**
+ * normalizeToolMessages returns a defensive copy of the message list where
+ * every assistant turn carrying `tool_calls` is followed by a tool-role
+ * message for EACH tool_call_id. Missing responses are back-filled with an
+ * error placeholder so the API (DeepSeek/OpenAI) never rejects with
+ * "insufficient tool messages following tool_calls".
+ *
+ * Also drops a trailing assistant.tool_calls that has no results at all
+ * (can't legally end a request). This is the root fix for the recurring
+ * HTTP 400 tool_calls pairing error.
+ */
+/**
+ * Event-driven wait for async agent runs. Subscribes to collab:event for
+ * agent.<id>.done and resolves when every runId in the list has completed.
+ * Runs without a backend timeout — the wait naturally ends when all agents
+ * finish (or the chat is stopped via stopRequested).
+ */
+async function waitForCollabRuns(args: Record<string, unknown>): Promise<ToolCallResult> {
+  const raw = args.runIds
+  if (!Array.isArray(raw) || !raw.length) {
+    return { success: false, error: 'collab_wait: runIds must be a non-empty array' }
+  }
+  const runIds = raw.map(String)
+  const remaining = new Set(runIds)
+  const results: any[] = []
+  const rt = window.runtime as any
+  let stopWatcher: ReturnType<typeof setInterval> | null = null
+
+  const cleanup = () => {
+    rt.EventsOff('collab:event', handler)
+    if (stopWatcher) { clearInterval(stopWatcher); stopWatcher = null }
+  }
+
+  const handler = (envelope: any) => {
+    if (stopRequested.value) { cleanup(); return }
+    const ev = envelope?.data || {}
+    const topic: string = ev.topic || ''
+    const m = topic.match(/^agent\.(.+)\.done$/)
+    if (!m) return
+    const payload = ev.payload || {}
+    const runId: string = payload.runId || ev.source || ''
+    if (!remaining.has(runId)) return
+    remaining.delete(runId)
+    results.push({ runId, agentId: m[1], status: 'done', result: payload.result })
+  }
+
+  return new Promise((resolve) => {
+    let resolved = false
+    const resolveOnce = (r: ToolCallResult) => {
+      if (resolved) return
+      resolved = true; cleanup(); resolve(r)
+    }
+    rt.EventsOn('collab:event', handler)
+    stopWatcher = setInterval(() => {
+      if (remaining.size === 0) { resolveOnce({ success: true, data: results }) }
+      if (stopRequested.value) { resolveOnce({ success: false, error: '用户已终止' }) }
+    }, 300)
+  })
+}
+
+function normalizeToolMessages(msgs: APIMessage[]): APIMessage[] {
+  const out: APIMessage[] = []
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i]
+    // Drop a dangling trailing assistant.tool_calls with zero following tool
+    // results — it can't be repaired meaningfully and would 400/422.
+    if (m.role === 'assistant' && m.tool_calls?.length) {
+      const isLast = i === msgs.length - 1
+      const nextIsTool = !isLast && msgs[i + 1].role === 'tool'
+      if (isLast || !nextIsTool) {
+        // Keep the assistant content but strip tool_calls.
+        out.push({ role: 'assistant', content: m.content || '(工具调用未完成)' })
+        continue
+      }
+    }
+    out.push(m)
+    // If this is an assistant with tool_calls, ensure every id has a tool reply.
+    if (m.role === 'assistant' && m.tool_calls?.length) {
+      // Collect the tool_call_ids answered by the immediately following tool msgs.
+      const answered = new Set<string>()
+      for (let j = i + 1; j < msgs.length && msgs[j].role === 'tool'; j++) {
+        if (msgs[j].tool_call_id) answered.add(msgs[j].tool_call_id!)
+      }
+      // Back-fill missing ones right after the assistant message, but ONLY if
+      // there is at least one following tool message (otherwise we'd be
+      // synthesizing a reply for a dangling turn — handled by the strip above).
+      for (const tc of m.tool_calls) {
+        if (!answered.has(tc.id)) {
+          out.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            content: JSON.stringify({ success: false, error: '(工具结果缺失，已补占位以维持对话完整性)' }),
+          })
+        }
+      }
+    }
+  }
+  return out
+}
+
 // ── Toast injection (same pattern as downloadStore) ──
 
 let _toastFn: ((type: string, title: string, desc?: string) => void) | null = null
@@ -142,9 +243,10 @@ export const useChatStore = defineStore('chat', () => {
   // Agents visible in the current domain: agents whose library matches the
   // active library, plus core agents from the default library (always shown).
   const visibleAgents = computed(() => {
+    const list = agents.value || []
     const libId = activeLibraryId.value
-    if (!libId) return agents.value
-    return agents.value.filter(a =>
+    if (!libId) return list
+    return list.filter(a =>
       !a.libraryId || a.libraryId === libId || a.isDefault
     )
   })
@@ -289,7 +391,7 @@ export const useChatStore = defineStore('chat', () => {
 
   async function loadSkills() {
     try {
-      skills.value = await window.go.main.App.ListSkills() || []
+      skills.value = await window.go.main.App.ListSkills('') || []
     } catch (_) { /* use defaults */ }
   }
 
@@ -375,7 +477,7 @@ export const useChatStore = defineStore('chat', () => {
         if (m.role === 'tool' && m.toolJson) {
           try {
             const tr = JSON.parse(m.toolJson)
-            toolMsgs.push({ role: 'tool', content: m.content, tool_call_id: tr.tool_call_id })
+            toolMsgs.push({ role: 'tool', content: m.content, tool_call_id: tr.tool_call_id, name: tr.name || '' } as any)
           } catch (_) {}
         }
       }
@@ -415,14 +517,34 @@ export const useChatStore = defineStore('chat', () => {
               matchedToolMsgs.push(tm)
             }
           }
-          if (matchedToolCalls.length === msg.tool_calls.length) {
-            // All tool calls have matching results — safe to include.
-            merged.push(msg)
-            merged.push(...matchedToolMsgs)
-          } else {
-            // Some tool results are missing — strip tool_calls for display + API safety.
-            merged.push({ role: 'assistant', content: msg.content, toolResults: msg.toolResults })
+          // Always include the message with its tool calls visible.
+          // If tool_results were not persisted (pre-existing data before the
+          // toolResults feature), reconstruct them from the matching tool
+          // messages so the terminal widget doesn't show "executing…" forever.
+          const displayToolResults: any[] = (msg.toolResults || []).slice()
+          if (!displayToolResults.length && matchedToolMsgs.length) {
+            for (const tm of matchedToolMsgs) {
+              try {
+                const r = JSON.parse(tm.content || '{}')
+                displayToolResults.push({ name: (tm as any).name || '', args: {}, result: r })
+              } catch (_) {
+                displayToolResults.push({ name: (tm as any).name || '', args: {}, result: { success: false, error: '(解析失败)' } })
+              }
+            }
           }
+          // Back-fill missing slots so every tool_call has a toolResults entry.
+          if (displayToolResults.length < msg.tool_calls.length) {
+            for (let j = displayToolResults.length; j < msg.tool_calls.length; j++) {
+              displayToolResults.push({
+                name: msg.tool_calls[j].function?.name || '',
+                args: {},
+                result: { success: false, error: '(结果丢失)' },
+              })
+            }
+          }
+          msg.toolResults = displayToolResults
+          merged.push(msg)
+          merged.push(...matchedToolMsgs)
         } else {
           merged.push(msg)
         }
@@ -654,6 +776,14 @@ export const useChatStore = defineStore('chat', () => {
         messages.value.push({ role: 'assistant', content: '❗ 加载 Agent 失败: ' + errMsg(e) })
         return
       }
+      // P10: Append domain context even when using a specific agent.
+      const libId = activeLibraryId.value
+      if (libId) {
+        try {
+          const domainCtx = await go.BuildDomainSystemPrompt(libId)
+          if (domainCtx) systemContent += '\n' + domainCtx
+        } catch (_) { /* best-effort */ }
+      }
     } else {
       let enabledNames: string[]
       try { enabledNames = await go.GetEnabledToolNames() } catch (_) { enabledNames = [] }
@@ -672,9 +802,9 @@ export const useChatStore = defineStore('chat', () => {
         return
       }
 
-      // Build system prompt from enabled skills
+      // Build system prompt from enabled skills — domain-scoped.
       let enabledSkills: SkillInfo[]
-      try { enabledSkills = await go.ListEnabledSkills() } catch (_) { enabledSkills = [] }
+      try { enabledSkills = await go.ListEnabledSkills(activeLibraryId.value) } catch (_) { enabledSkills = [] }
 
       const basePrompt = '你是 EverEvo 桌面软件的 AI 助手。用户说中文，用中文回复。当需要执行操作时使用工具调用。每次回复尽量简洁。\n\n用户可能通过拖拽或粘贴上传文件到对话中。对于文本文件（TXT、MD、CSV、JSON 等），内容会自动注入。对于 PDF 和图片文件，请使用 read_file 或 read_media_file 工具读取。对于扫描件 PDF（isScanned=true），请使用 read_media_file 工具以图片形式查看页面。'
       const skillPrompts = enabledSkills
@@ -684,6 +814,15 @@ export const useChatStore = defineStore('chat', () => {
       systemContent = skillPrompts
         ? `${basePrompt}\n\n当前启用的能力角色：\n${skillPrompts}`
         : basePrompt
+
+      // P10: Inject domain-scoped context (agents, skills, MCP for this domain only).
+      const libId = activeLibraryId.value
+      if (libId) {
+        try {
+          const domainCtx = await go.BuildDomainSystemPrompt(libId)
+          if (domainCtx) systemContent += '\n' + domainCtx
+        } catch (_) { /* best-effort: domain context is additive, not required */ }
+      }
     }
 
     // Think mode: inject English reasoning instruction with effort level.
@@ -768,27 +907,22 @@ export const useChatStore = defineStore('chat', () => {
 	      } catch (_) {}
 	    }
 
-    const apiMsgs: APIMessage[] = [
+    const apiMsgs: APIMessage[] = normalizeToolMessages([
       { role: 'system', content: systemContent },
       ...messages.value.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool'),
-    ]
+    ])
 
-    // Read-only tools (workflow_status / plugin_status / system_dynamic, …) are
-    // pure status queries. Rounds that call ONLY these don't consume the
-    // productive budget, so polling a long workflow no longer hits the round
-    // limit. Both counters stay bounded to prevent runaway loops.
-    const readOnlyNames = new Set(tools.filter(t => t.annotations?.readOnlyHint).map(t => t.name))
-    const isReadOnly = (n: string) => readOnlyNames.has(n)
-    const MAX_ITERATIONS = 60   // absolute backstop (any round type)
-    const MAX_PRODUCTIVE = 25   // rounds invoking at least one non-read-only tool
-    let productive = 0
-
+    // No round cap (requested): the loop runs until the model returns a final
+    // answer (no more tool calls) or the user stops it. No iteration /
+    // productive budgets.
     stopRequested.value = false
     currentStreamId.value = ''
-    for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
+    let round = 0
+    for (;;) {
       if (stopRequested.value) { busy.value = false; currentStreamId.value = ''; return }
+      round++
       // MemGPT-style: emergency compression mid-loop (multi-turn spillover).
-      if (contextPct.value > 50 && iter > 5 && iter % 3 === 0) {
+      if (contextPct.value > 50 && round > 5 && round % 3 === 0) {
         await maybeCompressContext()
       }
       const msgIdx = messages.value.length
@@ -832,10 +966,14 @@ export const useChatStore = defineStore('chat', () => {
             function: { name: t.name, description: t.description, parameters: t.parameters },
           }))
           const effort = thinkMode.value ? thinkEffort.value : ''
+          // Normalize before every send: guarantee every assistant.tool_calls
+          // is followed by a matching tool result (DeepSeek/OpenAI reject
+          // dangling tool_calls with HTTP 400). Cheap defensive copy per turn.
+          const sendMsgs = normalizeToolMessages(apiMsgs)
           if (agentStream) {
-            agentsApi.streamAs(streamId, apiMsgs, toolPayload, agentStream.providerId, agentStream.model, agentStream.temperature, agentStream.maxTokens, effort).catch(reject)
+            agentsApi.streamAs(streamId, sendMsgs, toolPayload, agentStream.providerId, agentStream.model, agentStream.temperature, agentStream.maxTokens, effort).catch(reject)
           } else {
-            go.ChatStream(streamId, apiMsgs, toolPayload, effort).catch(reject)
+            go.ChatStream(streamId, sendMsgs, toolPayload, effort).catch(reject)
           }
         })
 
@@ -874,7 +1012,7 @@ export const useChatStore = defineStore('chat', () => {
         if (!msg.tool_calls?.length && msg.content) {
           const u = lastUserContent()
           if (u) {
-            memoryApi.remember(u, msg.content, currentSessionId.value)
+            memoryApi.remember(u, msg.content, currentSessionId.value, activeLibraryId.value)
               .catch(e => console.error('[chat] remember failed:', errMsg(e)))
           }
         }
@@ -885,38 +1023,79 @@ export const useChatStore = defineStore('chat', () => {
           for (const tc of msg.tool_calls) {
             let args: Record<string, unknown> = {}
             try { args = JSON.parse(tc.function.arguments || '{}') } catch (_) { /* keep empty */ }
+            if (stopRequested.value) {
+              messages.value[msgIdx].toolResults!.push({ name: tc.function.name, args, result: { success: false, error: '用户已终止' } })
+              break
+            }
+            // Push placeholder so the UI immediately shows "executing…" before
+            // the (potentially slow) CallTool resolves. The startedAt field
+            // lets the UI show elapsed time so the user can judge stuck vs slow.
+            const idx = messages.value[msgIdx].toolResults!.length
+            messages.value[msgIdx].toolResults!.push({ name: tc.function.name, args, result: null as any, startedAt: Date.now() })
+            messages.value[msgIdx] = { ...messages.value[msgIdx] } // trigger reactivity for placeholder
             let result: ToolCallResult
-            try {
-              result = await go.CallTool(tc.function.name, args)
-            } catch (e: unknown) {
-              const msg = e instanceof Error ? e.message : String(e)
-              result = { success: false, error: msg }
+            // collab_wait is event-driven: subscribe to agent.<id>.done events
+            // so the UI can show each sub-agent finishing in real time instead
+            // of blocking silently on the backend. No per-tool timeout — the
+            // wait naturally ends when all runs complete.
+            if (tc.function.name === 'collab_wait') {
+              result = await waitForCollabRuns(args)
+            } else {
+              const TOOL_TIMEOUT = 60_000
+              const callPromise = go.CallTool(tc.function.name, args) as Promise<ToolCallResult>
+              try {
+                result = await Promise.race([
+                  callPromise,
+                  new Promise<never>((_, reject) => setTimeout(() => reject(new Error('工具调用超时 (60s)')), TOOL_TIMEOUT)),
+                ])
+              } catch (e: unknown) {
+                const msg = e instanceof Error ? e.message : String(e)
+                result = { success: false, error: msg }
+                // The backend is still running — when it finishes, replace the
+                // timeout error with the real result so the conversation (and
+                // the terminal widget) can see it in later rounds.
+                const toolCallId = tc.id
+                callPromise.then((late) => {
+                  // Update terminal display (tool result block)
+                  if (idx < messages.value[msgIdx].toolResults!.length) {
+                    messages.value[msgIdx].toolResults![idx].result = late
+                    messages.value[msgIdx] = { ...messages.value[msgIdx] }
+                  }
+                  // Swap the "超时" tool message for the real result so the LLM
+                  // can consume it in the next round.
+                  for (let k = messages.value.length - 1; k >= 0; k--) {
+                    const mk = messages.value[k]
+                    if (mk.role === 'tool' && mk.tool_call_id === toolCallId && (mk.content || '').includes('超时')) {
+                      mk.content = JSON.stringify(late)
+                      break
+                    }
+                  }
+                }).catch(() => {})
+              }
+            }
+            // Swap placeholder with real result and force reactivity so the
+            // terminal widget transitions from "executing…" to "done/error".
+            if (idx < messages.value[msgIdx].toolResults!.length) {
+              messages.value[msgIdx].toolResults![idx].result = result
+              messages.value[msgIdx] = { ...messages.value[msgIdx] }
             }
             const toolMsg = { role: 'tool' as const, tool_call_id: tc.id, content: JSON.stringify(result) }
             apiMsgs.push(toolMsg)
             messages.value.push(toolMsg)
-            messages.value[msgIdx].toolResults!.push({ name: tc.function.name, args, result })
             // Persist tool result as a tool message so it can be restored.
             const toolJson = JSON.stringify({ tool_call_id: tc.id, name: tc.function.name, args })
             memoryApi.messageAppend(currentSessionId.value, 'tool', JSON.stringify(result), toolJson).catch(() => {})
           }
-          // Update assistant message with full tool data for display restore.
+          // Update assistant message with tool execution results.
+          // Backend uses JSON merge (not replace), so reasoning from the
+          // earlier persist is preserved automatically.
           if (persistedId && messages.value[msgIdx].toolResults?.length) {
-            const updated = { tool_calls: msg.tool_calls,
+            const updated: any = {
               tool_results: messages.value[msgIdx].toolResults!.map(tr => ({
                 name: tr.name, args: tr.args, result: tr.result,
               })),
             }
             memoryApi.messageUpdateToolJSON(persistedId, JSON.stringify(updated)).catch(() => {})
-          }
-          // Read-only-only rounds (e.g. workflow_status polling) are free;
-          // other rounds count toward the productive budget.
-          if (!msg.tool_calls.every(tc => isReadOnly(tc.function.name))) {
-            productive++
-            if (productive >= MAX_PRODUCTIVE) {
-              messages.value.push({ role: 'assistant', content: `⚠ 已达最大有效工具调用轮次（${MAX_PRODUCTIVE} 次）。` })
-              return
-            }
           }
           continue
         }
@@ -931,7 +1110,8 @@ export const useChatStore = defineStore('chat', () => {
       }
       return
     }
-    messages.value.push({ role: 'assistant', content: `⚠ 已达最大轮次（${MAX_ITERATIONS}）。` })
+    // The for(;;) above has no break — the function returns from inside the loop.
+    // This line is unreachable and satisfies TypeScript's control-flow analysis.
   }
 
   return {

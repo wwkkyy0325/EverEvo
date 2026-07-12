@@ -45,11 +45,30 @@ type Manager struct {
 	sources []Source
 }
 
-// NewManager creates a guide manager and loads persisted sources.
-func NewManager() *Manager {
+// NewManager creates a guide manager and loads persisted sources. On first run
+// (no sources.json yet) it seeds the bundled EverEvo usage-guide source and
+// persists it. The returned seeded flag lets the caller trigger an initial sync
+// so the Guide Center is populated immediately.
+func NewManager() (*Manager, bool) {
 	m := &Manager{}
 	m.loadSources()
-	return m
+	if len(m.sources) == 0 {
+		m.sources = []Source{defaultEverEvoSource()}
+		_ = m.saveSources()
+		return m, true
+	}
+	return m, false
+}
+
+// defaultEverEvoSource is the built-in local source that ships the app's own
+// usage guides (embedded markdown, synced from the binary — no network).
+func defaultEverEvoSource() Source {
+	return Source{
+		Name:    "everevo",
+		Title:   "EverEvo 使用指南",
+		Type:    "local",
+		Enabled: true,
+	}
 }
 
 // ─── Sources ──────────────────────────────────────────────────────
@@ -271,6 +290,8 @@ func (m *Manager) syncSource(src Source) error {
 		return m.syncGit(src)
 	case "url":
 		return m.syncURL(src)
+	case "local":
+		return m.syncLocal(src)
 	default:
 		return fmt.Errorf("unknown source type: %s", src.Type)
 	}

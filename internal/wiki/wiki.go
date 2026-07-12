@@ -333,6 +333,20 @@ func (s *Store) DeletePage(pageID string) error {
 	return err
 }
 
+// SavePageRaw stores a wiki page in the DB without embedding (no chromem index).
+// Useful when the embedding model isn't loaded yet — the page can be re-indexed
+// later via WikiReindex / ClearLLMWiki which picks up user pages from the DB.
+func (s *Store) SavePageRaw(pageID, title, content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	_, err := s.sql.Exec(`INSERT INTO wiki_pages(id, title, path, modified, chunk_count, source, content)
+		VALUES(?, ?, '', ?, 0, 'user', ?)
+		ON CONFLICT(id) DO UPDATE SET title=excluded.title, modified=excluded.modified, content=excluded.content`,
+		pageID, title, now, content)
+	return err
+}
+
 // GetPageContent returns the raw markdown content of a page.
 func (s *Store) GetPageContent(pageID string) (string, error) {
 	var content string

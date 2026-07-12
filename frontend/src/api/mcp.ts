@@ -12,6 +12,7 @@ export interface MCPServer {
   command: string
   args: string[]
   url: string
+  libraryId?: string
   status: 'connected' | 'connecting' | 'disconnected' | 'error'
   toolCount?: number
   error?: string
@@ -41,7 +42,7 @@ export const mcpApi = {
   setPort(port: number) { return call(() => App().SetMCPPort(port)) },
 
   // External MCP servers
-  listServers() { return call<MCPServer[]>(() => App().ListMCPServers()) },
+  listServers(libraryId = '') { return call<MCPServer[]>(() => App().ListMCPServers(libraryId)) },
   addServer(cfg: Partial<MCPServer>) { return call(() => App().AddMCPServer(cfg)) },
   removeServer(id: string) { return call(() => App().RemoveMCPServer(id)) },
   connectServer(id: string) { return call(() => App().ConnectMCPServer(id)) },

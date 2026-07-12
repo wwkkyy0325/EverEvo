@@ -38,6 +38,8 @@ export const systemApi = {
   },
   getExeDir() { return call<string>(() => App().GetExeDir()) },
   getUserConfigDir() { return call<string>(() => App().GetUserConfigDir()) },
+  getDataDir() { return call<string>(() => App().GetDataDir()) },
+  getModelsDir() { return call<string>(() => App().GetModelsDir()) },
   openDir(path: string) { return call(() => App().OpenDir(path)) },
   openFileLocation(path: string) { return call<void>(() => App().OpenFileLocation(path)) },
   logToTerminal(msg: string) { return call<void>(() => App().LogToTerminal(msg)) },

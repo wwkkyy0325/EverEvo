@@ -1,6 +1,7 @@
 ﻿package client
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -172,6 +173,12 @@ func (m *Manager) UpdateServer(cfg ServerConfig) error {
 
 // ListServers returns all configured server statuses.
 func (m *Manager) ListServers() []ServerConfig {
+	return m.ListServersByLibrary("")
+}
+
+// ListServersByLibrary returns servers filtered by library ID. Empty libraryID
+// returns all servers (backward-compatible).
+func (m *Manager) ListServersByLibrary(libraryID string) []ServerConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -183,9 +190,104 @@ func (m *Manager) ListServers() []ServerConfig {
 			cfg.ToolCount = len(c.Tools)
 		}
 		c.mu.Unlock()
+		if libraryID != "" && cfg.LibraryID != libraryID {
+			continue
+		}
 		out = append(out, cfg)
 	}
 	return out
+}
+
+// BackfillLibraryIDs sets LibraryID on all servers that don't have one (or have
+// an invalid/dangling one), then saves. Safe to call at startup. validIDs is the
+// set of current domain library IDs from the memory store.
+func (m *Manager) BackfillLibraryIDs(defaultLibraryID string, validIDs []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	valid := make(map[string]bool, len(validIDs))
+	for _, id := range validIDs {
+		valid[id] = true
+	}
+	changed := false
+	for _, c := range m.connections {
+		c.mu.Lock()
+		if c.Cfg.LibraryID == "" || !valid[c.Cfg.LibraryID] {
+			if c.Cfg.LibraryID != "" {
+				log.Printf("[mcp] MCP Server %q 的 libraryId %q 无效，回填为默认领域", c.Cfg.Name, c.Cfg.LibraryID)
+			}
+			c.Cfg.LibraryID = defaultLibraryID
+			changed = true
+		}
+		c.mu.Unlock()
+	}
+	if changed {
+		_ = m.save()
+	}
+}
+
+// ReassignByHeuristic re-assigns MCP servers that are still in the default
+// library to more appropriate domains based on naming heuristics. Called at
+// startup after BackfillLibraryIDs. validIDs maps domain name → domain ID.
+func (m *Manager) ReassignByHeuristic(defaultLibraryID string, validIDs map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Heuristic rules: keyword → domain name
+	rules := []struct{ keyword, domainName string }{
+		{"search", "搜索"},
+		{"searx", "搜索"},
+		{"github", "开发"},
+		{"git", "开发"},
+		{"code", "开发"},
+		{"file", "文件管理"},
+		{"filesystem", "文件管理"},
+		{"fs", "文件管理"},
+		{"browser", "浏览器"},
+		{"playwright", "浏览器"},
+		{"web", "浏览器"},
+		{"mcp", "MCP"},
+		{"server", "MCP"},
+	}
+	changed := false
+	for _, conn := range m.connections {
+		conn.mu.Lock()
+		// Only reassign if still in the default library.
+		if conn.Cfg.LibraryID != defaultLibraryID && conn.Cfg.LibraryID != "" {
+			conn.mu.Unlock()
+			continue
+		}
+		lcName := strings.ToLower(conn.Cfg.Name)
+		matched := false
+		for _, r := range rules {
+			if strings.Contains(lcName, r.keyword) {
+				// Try exact domain name match first.
+				if id, ok := validIDs[r.domainName]; ok && id != "" {
+					conn.Cfg.LibraryID = id
+					matched = true
+					log.Printf("[mcp] %q -> domain %q (keyword: %s)", conn.Cfg.Name, r.domainName, r.keyword)
+					break
+				}
+				// Fuzzy: find any domain whose name contains the keyword.
+				for name, id := range validIDs {
+					if strings.Contains(strings.ToLower(name), r.keyword) || strings.Contains(strings.ToLower(r.keyword), strings.ToLower(name)) {
+						conn.Cfg.LibraryID = id
+						matched = true
+						log.Printf("[mcp] %q -> domain %q (fuzzy: %s)", conn.Cfg.Name, name, r.keyword)
+						break
+					}
+				}
+				if matched {
+					break
+				}
+			}
+		}
+		if matched {
+			changed = true
+		}
+		conn.mu.Unlock()
+	}
+	if changed {
+		_ = m.save()
+	}
 }
 
 // GetServerTools returns the tools discovered from a connected server.
@@ -231,8 +333,12 @@ func (m *Manager) Connect(id string) error {
 	select {
 	case r := <-done:
 		return r.err
-	case <-time.After(30 * time.Second):
-		return fmt.Errorf("connection timed out after 30s")
+	case <-time.After(120 * time.Second):
+		conn.mu.Lock()
+		conn.Cfg.Status = "error"
+		conn.Cfg.Error = "连接超时（120s）"
+		conn.mu.Unlock()
+		return fmt.Errorf("connection timed out after 120s")
 	}
 }
 
@@ -248,7 +354,10 @@ func (m *Manager) doConnect(conn *Connection, id string, cfg ServerConfig) error
 		}
 		if cfg.Command == "npx" || cfg.Command == "npm" {
 				if pkg := extractNPMPackage(cfg.Args); pkg != "" {
-					ensureNpmPackage(pkg)
+					if ee := ensureNpmPackage(pkg); ee != nil {
+						log.Printf("[mcp] npm dependency check/install failed for %s: %v", pkg, ee)
+						// non-fatal: npx may still resolve the package at runtime
+					}
 				}
 			}
 			t, err = newStdioTransport(cfg.Command, cfg.Args, cfg.Env)
@@ -404,6 +513,12 @@ func (m *Manager) CallTool(fullName string, params map[string]any) (*tools.ToolR
 		return nil, fmt.Errorf("server %q not connected", serverID)
 	}
 
+	// MCP servers require `arguments` to be an object even when the tool takes
+	// no params (e.g. list_allowed_directories returns -32602 "expected object,
+	// received undefined" if omitted). Guarantee a non-nil map.
+	if params == nil {
+		params = map[string]any{}
+	}
 	callParams := callToolParams{
 		Name:      toolName,
 		Arguments: params,
@@ -452,7 +567,7 @@ func GetRecommends() []RecommendInfo {
 			Key: "filesystem", Name: "Filesystem",
 			Description: "读取、写入、搜索本地文件系统（含上传目录）",
 			Transport:   "stdio", Command: "npx",
-			Args:     []string{"-y", "@modelcontextprotocol/server-filesystem", ".", "data/uploads"},
+			Args:     []string{"-y", "@modelcontextprotocol/server-filesystem", ".", "data/uploads", "data/skills", "data/plugins", "data/guides", "data/memory"},
 			Category: "filesystem",
 		},
 		{
@@ -511,14 +626,29 @@ func extractNPMPackage(args []string) string {
 }
 
 // ensureNpmPackage installs an npm package globally if not already present.
+// Each npm invocation has its own timeout so a slow registry or network doesn't
+// block the caller indefinitely.
 func ensureNpmPackage(pkg string) error {
-	check := exec.Command("npm", "list", "-g", pkg, "--depth=0")
-	if check.Run() == nil {
-		return nil
+	// Quick check: test whether the package is already globally available.
+	// npm ls --depth=0 is fast for installed packages (pure local check).
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "npm", "ls", "-g", pkg, "--depth=0")
+		if cmd.Run() == nil {
+			return nil // already installed
+		}
 	}
-	log.Printf("[mcp] installing %s ...", pkg)
-	install := exec.Command("npm", "install", "-g", pkg)
-	return install.Run()
+	log.Printf("[mcp] installing %s (may take a minute)…", pkg)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "npm", "install", "-g", pkg)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("npm install %s failed: %w\n%s", pkg, err, string(out))
+	}
+	log.Printf("[mcp] %s installed", pkg)
+	return nil
 }
 
 func mcpToInternalTool(mt mcpToolDef, serverID, serverName string) *tools.ToolDef {

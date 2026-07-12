@@ -30,10 +30,13 @@ func (a *App) GetAgent(id string) (*agents.Agent, error) {
 	return a.agentManager.Get(id)
 }
 
-// CreateAgent creates a new local agent.
+// CreateAgent creates a new local agent. LibraryID is required.
 func (a *App) CreateAgent(agent agents.Agent) (*agents.Agent, error) {
 	if a.agentManager == nil {
 		return nil, fmt.Errorf("agent 管理器未初始化")
+	}
+	if err := a.validateLibraryID(agent.LibraryID); err != nil {
+		return nil, fmt.Errorf("创建 Agent 失败: %w", err)
 	}
 	created, err := a.agentManager.Create(agent)
 	if err != nil {

@@ -1,8 +1,10 @@
 package guides
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -88,6 +90,35 @@ func gitClone(url, branch, dir string) error {
 		return fmt.Errorf("git clone: %w (请确认 git 已安装且 URL 有效: %s)", err, url)
 	}
 	return nil
+}
+
+// syncLocal materializes the bundled (embedded) EverEvo usage guides into the
+// source's local directory. Idempotent: files that already exist with identical
+// content are skipped. Used only by the internal default "everevo" source so the
+// Guide Center is non-empty out of the box, with no network dependency.
+func (m *Manager) syncLocal(src Source) error {
+	dir := m.sourceDir(src.Name)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create dir: %w", err)
+	}
+	efs := embeddedUserGuides()
+	return fs.WalkDir(efs, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.EqualFold(filepath.Ext(path), ".md") {
+			return nil
+		}
+		data, rErr := fs.ReadFile(efs, path)
+		if rErr != nil {
+			return rErr
+		}
+		dest := filepath.Join(dir, path)
+		if existing, eErr := os.ReadFile(dest); eErr == nil && bytes.Equal(existing, data) {
+			return nil // identical — skip write
+		}
+		return os.WriteFile(dest, data, 0644)
+	})
 }
 
 // gitPull runs git pull in an existing repo.

@@ -118,4 +118,24 @@ func registerPluginTools() {
 			Required: []string{"name"},
 		},
 	})
+
+	// ── Agent self-writes plugins (multi-runtime) ──
+	Register(&ToolDef{
+		Name:        "plugin_create",
+		Description: "用代码创建新插件并热加载。支持三种运行时：python（默认，自动 venv 隔离）、go（编译为 EXE）、node（Node.js/TypeScript）。Agent 提供名称+代码+运行时，系统自动生成模板、安装、热启动",
+		Category:    "plugin",
+		Parameters: &ToolParams{
+			Type: "object",
+			Properties: map[string]ToolProp{
+				"name":         {Type: "string", Description: "插件名称（小写字母+连字符）"},
+				"runtime":      {Type: "string", Description: "运行时: python（默认）| go | node"},
+				"description":  {Type: "string", Description: "插件功能描述"},
+				"code":         {Type: "string", Description: "插件源码。python: def handle(method,params) 函数体; go: package main + JSON-RPC I/O; node: async function handle(method,params)"},
+				"methods":      {Type: "string", Description: "逗号分隔的方法名，默认 health,info"},
+				"dependencies": {Type: "string", Description: "python: pip 包名（空格分隔）; node: npm 包名; go: 忽略"},
+				"autoStart":    {Type: "boolean", Description: "安装后是否立即热启动（默认 true）"},
+			},
+			Required: []string{"name", "code"},
+		},
+	})
 }

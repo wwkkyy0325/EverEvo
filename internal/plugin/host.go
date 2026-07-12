@@ -99,23 +99,46 @@ func (h *Host) Start(spec Spec) error {
 
 	entry := filepath.Join(spec.Dir, spec.Entry)
 
-	// Resolve runtime executable
+	// Resolve runtime executable and arguments.
+	//   "python" → python(.exe from venv) entry.py
+	//   "node"   → node entry.js
+	//   ""       → entry is the compiled binary itself
+	//   other    → spec.Runtime entry (custom launcher)
 	var exe string
+	var cmdArgs []string
 	switch spec.Runtime {
 	case "python":
-		// Prefer the plugin's own venv, fall back to system python
+		// Resolution order: plugin venv → EVEREVO_PYTHON env override → PATH.
+		// EVEREVO_PYTHON lets users point at a specific interpreter (conda,
+		// pyenv, custom install) when `python` on PATH is wrong.
 		venvPython := filepath.Join(spec.Dir, spec.Env, "Scripts", "python.exe")
 		if _, err := os.Stat(venvPython); err == nil {
 			exe = venvPython
+		} else if envPy := os.Getenv("EVEREVO_PYTHON"); envPy != "" {
+			exe = envPy
 		} else {
 			exe = "python"
 		}
+		// -u: unbuffered stdin/stdout — critical for JSON-RPC line protocol
+		cmdArgs = []string{"-u", entry}
+	case "node":
+		exe = "node"
+		cmdArgs = []string{entry}
+	case "":
+		// Compiled executable (Go, Rust, etc.) — entry IS the binary.
+		exe = entry
 	default:
 		exe = spec.Runtime
+		cmdArgs = []string{entry}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, exe, entry)
+	var cmd *exec.Cmd
+	if len(cmdArgs) > 0 {
+		cmd = exec.CommandContext(ctx, exe, cmdArgs...)
+	} else {
+		cmd = exec.CommandContext(ctx, exe)
+	}
 	cmd.Dir = spec.Dir
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
@@ -154,6 +177,18 @@ func (h *Host) Start(spec Spec) error {
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return fmt.Errorf("启动插件进程失败: %w", err)
+	}
+
+	// Short startup window (600ms): if the process exits immediately it's a
+	// launch failure (bad Python/interpreter, missing deps, entry script crash).
+	// This surfaces the problem at StartPlugin time instead of later timeout.
+	alive := make(chan struct{})
+	go func() { cmd.Wait(); close(alive) }()
+	select {
+	case <-alive:
+		cancel()
+		return fmt.Errorf("plugin %s exited immediately after start — check entry script and Python environment\nstderr: %s", spec.Name, proc.stderrBuf.String())
+	case <-time.After(600 * time.Millisecond):
 	}
 
 	h.processes[spec.Name] = proc

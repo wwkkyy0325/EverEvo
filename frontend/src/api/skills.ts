@@ -18,6 +18,7 @@ export interface Skill {
   systemPrompt: string
   mcpTools: string[]
   enabled: boolean
+  libraryId?: string
 }
 
 export interface SkillPackage {
@@ -41,8 +42,8 @@ export interface GuideSource {
 }
 
 export const skillsApi = {
-  list() { return call<Skill[]>(() => App().ListSkills()) },
-  listEnabled() { return call<Skill[]>(() => App().ListEnabledSkills()) },
+  list(libraryId = '') { return call<Skill[]>(() => App().ListSkills(libraryId)) },
+  listEnabled(libraryId = '') { return call<Skill[]>(() => App().ListEnabledSkills(libraryId)) },
   create(skill: Partial<Skill>) { return call(() => App().CreateSkill(skill)) },
   update(name: string, skill: Partial<Skill>) { return call(() => App().UpdateSkill(name, skill)) },
   remove(name: string) { return call(() => App().DeleteSkill(name)) },

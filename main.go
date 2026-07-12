@@ -4,6 +4,7 @@ package main
 
 import (
 	"embed"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,16 @@ import (
 var frontendAssets embed.FS
 
 func main() {
+	// --zone flag for multi-instance runtime isolation.
+	// Production instance: everevo.exe (defaults to "production")
+	// Experiment instance: everevo.exe --zone=experiment-fix-auth
+	var zoneFlag string
+	flag.StringVar(&zoneFlag, "zone", "production", "runtime zone name (production | experiment-*)")
+	flag.Parse()
+
+	// Set early so storage.AppDataDir() and all subsystems pick up the zone.
+	os.Setenv("EVEREVO_ZONE", zoneFlag)
+
 	app := NewApp()
 
 	err := wails.Run(&options.App{

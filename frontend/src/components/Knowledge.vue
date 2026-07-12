@@ -181,10 +181,10 @@
         <!-- Tab switcher -->
         <div class="mem-tabs">
           <button class="mem-tab" :class="{ active: memTab === 'turn' }" @click="memTab = 'turn'">
-            💬 问答 · {{ turnItems.length }}
+            💬 问答 · {{ memStatus?.turnCount ?? turnItems.length }}
           </button>
           <button class="mem-tab" :class="{ active: memTab === 'fact' }" @click="memTab = 'fact'">
-            📌 事实 · {{ factItems.length }}
+            📌 事实 · {{ memStatus?.factCount ?? factItems.length }}
           </button>
         </div>
         <div class="mem-list" v-if="memTab === 'turn' && turnItems.length">
@@ -495,7 +495,7 @@ async function confirmCreateLibrary() {
   const name = newLibName.value.trim()
   if (!name) return
   showCreateLib.value = false
-  try { await memoryApi.libraryCreate(name, newLibDesc.value.trim(), false); await loadLibraries() } catch (e: unknown) { toast.show('error', '创建失败', errMsg(e)) }
+  try { await memoryApi.libraryCreate(name, newLibDesc.value.trim(), '', false); await loadLibraries() } catch (e: unknown) { toast.show('error', '创建失败', errMsg(e)) }
 }
 
 // A library is the core domain if it's the first (default) library in the list.
@@ -554,7 +554,7 @@ function openEditAgent(ag: LocalAgent) {
 watch(activeLibId, (id) => {
   activeLibraryId.value = id
   memoryApi.libraryBumpUse(id) // track usage frequency
-  showCreate.value = false; ragResults.value = []; ragSearched.value = false; ragQuery.value = ''; wikiResults.value = []; wikiPageContent.value = null; wikiActivePage.value = ''; wikiRendered.value = ''
+  showCreate.value = false; ragResults.value = []; ragSearched.value = false; ragQuery.value = ''; wikiResults.value = []; wikiPageContent.value = null; wikiActivePage.value = ''; wikiRendered.value = ''; wikiPages.value = []; wikiStatus.value = null; memItems.value = []; memStatus.value = null; kgNodes.value = []; kgEdges.value = []
   refreshKBs()
   refreshMemory()        // KG + wiki needs refreshing for all domains
   loadEntityLinks()       // cross-domain links may highlight current domain
@@ -823,7 +823,13 @@ function renderGraph() {
         kgSelectedEdge.value = null
       }
     })
-    if (kgLayoutMode.value === 'hier') applyLayout()
+    if (kgLayoutMode.value === 'hier') {
+      applyLayout()
+    } else {
+      kgNetwork!.once('stabilizationIterationsDone', () => {
+        if (kgNetwork) kgNetwork.setOptions({ physics: { enabled: false } })
+      })
+    }
     applyClusterMode()
 }
 
@@ -932,7 +938,7 @@ async function refreshMemory() {
   try {
     const s = await memoryApi.status(activeLibId.value)
     memStatus.value = s
-    memItems.value = (await memoryApi.list(50)) || []
+    memItems.value = (await memoryApi.list(50, activeLibId.value)) || []
     if (!memModelDir.value) memModelDir.value = s.modelDir || (embedModels.value[0]?.dir || '')
     const g = await memoryApi.listGraph(kgShowHistory.value, activeLibId.value)
     kgNodes.value = g?.nodes || []

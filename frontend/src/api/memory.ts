@@ -105,13 +105,13 @@ export const memoryApi = {
   /** Semantic recall: past Q&A turns + extracted facts relevant to the query. */
   recall(query: string, k: number) { return call<RecallResult>(() => App().MemoryRecall(query, k)) },
   /** Store a finalized user→assistant turn; triggers async fact extraction. */
-  remember(userText: string, reply: string, sessionId: string) {
-    return call(() => App().MemoryRemember(userText, reply, sessionId))
+  remember(userText: string, reply: string, sessionId: string, libraryId = '') {
+    return call(() => App().MemoryRemember(userText, reply, sessionId, libraryId))
   },
   /** Save a compression summary to long-term memory for future recall. */
   saveSummary(text: string) { return call(() => App().MemorySaveSummary(text)) },
   status(libraryId = '') { return call<MemoryStatus>(() => App().MemoryStatus(libraryId)) },
-  list(k: number) { return call<MemoryItem[]>(() => App().MemoryList(k)) },
+  list(k: number, libraryId = '') { return call<MemoryItem[]>(() => App().MemoryList(k, libraryId)) },
   /** Delete a single memory item by ID. */
   itemDelete(id: string) { return call(() => App().MemoryItemDelete(id)) },
   clear() { return call(() => App().MemoryClear()) },
@@ -165,8 +165,9 @@ export const memoryApi = {
 
   // ── Domain Libraries (P7) ──
   libraryList() { return call<any[]>(() => App().LibraryList()) },
-  libraryCreate(name: string, description: string, autoCreated: boolean) { return call<string>(() => App().LibraryCreate(name, description, autoCreated)) },
+  libraryCreate(name: string, description: string, icon: string, autoCreated: boolean) { return call<string>(() => App().LibraryCreate(name, description, icon, autoCreated)) },
   libraryDelete(id: string) { return call(() => App().LibraryDelete(id)) },
+  libraryUpdate(id: string, name: string, description: string, icon: string) { return call(() => App().LibraryUpdate(id, name, description, icon)) },
   libraryBumpUse(id: string) { return call(() => App().LibraryBumpUse(id)) },
   libraryMerge(keepId: string, dropId: string) { return call(() => App().LibraryMerge(keepId, dropId)) },
 }
