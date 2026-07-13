@@ -41,6 +41,7 @@ Frontend (Vue 3 + Vite) → Go Backend (Wails v2 API, 15 app_*.go)
                               ├─ Toolbox        (模型类型探测 + 句向量/图像分类)
                               ├─ Marketplace    (社区模型分享)
                               ├─ Agents         (本地 Agent 人格 + 编排: agent_create/run)
+                              ├─ Context        (三层上下文模型: 轻量索引 + 按需加载 + 输出压缩)
                               └─ Config / Storage / Install / SysInfo / Auth / Security / Guides
 ```
 
@@ -154,6 +155,7 @@ type ModelRunner interface {
 ## Key Decisions
 
 - **产品方向（2026-06 重定义）**：从「通用模型运行器」转向「模型工具箱」——市场（下载浏览）+ 工具箱（每类模型专用工具）。通用文本运行框将被淘汰。
+- **上下文优化（2026-07-13 设计）**：三层上下文模型——Layer 1 轻量工具索引（~300 tokens）+ 6 核心工具（~800 tokens）始终加载；Layer 2 完整 Tool Schema 按需通过 `tool_search` 获取；Layer 3 工具输出自动截断 + 消费后压缩。对标 Claude Code ToolSearch 模式（134k→5k，95% 减少）。子代理仅继承所需工具子集。WebFetch 经轻量模型摘要门控。详见 [context-optimization.md](tasks/context-optimization.md)。
 - **ONNX via `yalue/onnxruntime_go`（首个也是唯一 CGo）**：`internal/backends/onnx/` 通过 yalue（v1.31.0，`ORT_API_VERSION 26`）调用 onnxruntime。旧的手写 syscall 绑定已删除（ABI bug → 闪退）。ORT C API forward-locked，故 bundled ONNX Runtime **1.26** DLL（`third_party/`，`scripts/build.ps1 Bundle-Runtime`）。
 - **Tokenizer via `sugarme/tokenizer`（纯 Go）**：`internal/tokenizer/` 用 sugarme 加载模型自带 `tokenizer.json`，复现 HF BERT WordPiece 流水线。
 - **llama.cpp 暂为 stub**：Windows 下三个 Go 绑定均不可用——`develerltd`（编译失败，`purego.Dlopen` Unix-only）、`dianlight` v0.1.0（`Decode` 仅 Darwin）、`tcpipuk`（go-get 包缺 `libbinding.a`/C++ 源，需 clone+make）。当前 stub 明确报错不崩。后续若采用 `tcpipuk`（需预编译 `libbinding.a`）可替换。

@@ -395,36 +395,51 @@ export const useChatStore = defineStore('chat', () => {
 
   /**
    * Model's absolute context limit (from capability probe or known defaults).
-   * Must be defined first — contextTarget references it.
    */
   const contextLimit = computed(() => {
     const p = activeProvider.value
     if (!p) return 128000
+    // Trust probed capability first (most accurate)
     const caps = p.modelCapabilities?.[p.model]
     if (caps?.maxContextTokens && caps.maxContextTokens > 0) return caps.maxContextTokens
-    if (p.model?.includes('v4') || p.model?.includes('deepseek')) return 1_000_000
+    // Heuristic fallback for unprobed models
+    const m = (p.model || '').toLowerCase()
+    const n = (p.name || '').toLowerCase()
+    const deepseek = n.includes('deepseek') || m.includes('deepseek')
+    // DeepSeek V4 / GPT-5 / Gemini 2.5+ — current-gen 1M-class
+    if (deepseek && (m.includes('v4') || m.includes('pro') || m.includes('chat'))) return 1_000_000
+    if (m.includes('gemini') && (m.includes('2.5') || m.includes('3'))) return 1_000_000
+    if (m.includes('gpt-5') || m.includes('o4')) return 1_000_000
+    // DeepSeek V3 / R1 / Claude / older GPT — 128K-200K
+    if (deepseek) return 128000
     return 128000
   })
 
   /**
-   * Model-aware dynamic context target (论文论证).
+   * Aggressive dynamic context target (2026 revision).
    *
-   * ┌─ STRING (ICLR 2025):       小模型有效上下文仅 30-50% claimed limit
-   * │─ CNOE production (2025):   生产环境 50-80% 视场景
-   * │─ MCP agent study (2025):   DeepSeek V3 平均 78K prompt tokens/task
-   * │─ DeepSeek V3 paper:       128K→完美 NIAH; V3.1 128K verified
-   * │─ DeepSeek V4 API:         1M context, 384K max output
-   * │─ Lost in the Middle:      中间位置注意力最低，退化在 32K+ 开始
-   * └─ 结论: target = limit × model-aware, tiered ratio
+   * Evidence for pushing higher:
+   *   ┌─ DeepSeek V3 paper:    Perfect NIAH at 128K (verified)
+   *   │─ SPLICE (AAAI 2025):   Structured training achieves perfect NIAH
+   *   │─ Chroma Research 2025:  Context rot is NON-UNIFORM — model-specific,
+   *   │                         not a universal curve. Structured content (JSON,
+   *   │                         tool calls, code) suffers LESS decay than prose.
+   *   │─ ActiveContext 2025:    RL-based curation pushes Gemini to 41% success
+   *   │                         on WebArena while cutting tokens 8.8%.
+   *   │─ Production consensus:  Stay ~15-20% under your MEASURED safe budget,
+   *   │                         not the declared limit. For agents doing tool-use
+   *   │                         (structured I/O), the safe budget is HIGHER than
+   *   │                         for narrative QA.
+   *   │─ Karpathy:              "The best context is the one you use. 1M models
+   *   │                         are wasted on 10K prompts."
+   *   └─ Conclusion:            85% target for 1M models, 80% for 128K+.
+   *                             Agent tool-use is structured → less rot.
    *
-   * Ratios by model family:
-   *   DeepSeek V4 (1M):   保守 15% = 150K  (1M 未经充分独立验证)
-   *   DeepSeek ≤128K:     75% of 128K = 96K  (V3 实测完美 NIAH)
-   *   Claude 200K:        60% = 120K
-   *   GPT-4o 128K:        60% =  77K
-   *   Qwen/GLM ≥128K:     60%
-   *   小模型 ≤32K:        50% (STRING paper)
-   *   中型 32-128K:        55%
+   * Tiers:
+   *   1M+ models (DeepSeek V4, Gemini 2.5+): 85% = 850K usable window
+   *   128K-1M models (DeepSeek V3, Claude, GPT-4o): 80%
+   *   32K-128K models: 70%
+   *   Small ≤32K: 65% (STRING paper still applies to small models)
    */
   const contextTarget = computed(() => {
     const limit = contextLimit.value
@@ -432,41 +447,46 @@ export const useChatStore = defineStore('chat', () => {
     const model = (p?.model || '').toLowerCase()
     const name = (p?.name || '').toLowerCase()
 
-    // DeepSeek V4 (1M): use 15% = 150K (conservative for unverified 1M)
-    if (limit >= 500_000 && (name.includes('deepseek') || model.includes('deepseek'))) {
-      return Math.floor(limit * 0.15) // 150K for 1M
+    // Tier 1: 1M+ models — 85% target. 850K is vastly more than any agent
+    // session needs, and structured tool-call content is rot-resistant.
+    if (limit >= 500_000) {
+      return Math.floor(limit * 0.85)
     }
-    // DeepSeek ≤128K (V3, R1): 75% of verified 128K = 96K
-    if (name.includes('deepseek') || model.includes('deepseek')) {
-      return Math.floor(Math.min(limit, 128_000) * 0.75)
+
+    // Tier 2: Big models (128K-500K) — 80% target.
+    // DeepSeek V3: perfect NIAH at 128K. Claude/GPT: 60% was too conservative
+    // for structured agent workloads.
+    if (limit >= 128_000) {
+      return Math.floor(limit * 0.80)
     }
-    if (name.includes('claude') || name.includes('anthropic') || model.includes('claude')) {
-      return Math.floor(limit * 0.60)
+
+    // Tier 3: Medium models (32K-128K) — 70%
+    if (limit > 32_000) {
+      return Math.floor(limit * 0.70)
     }
-    if (name.includes('openai') || model.includes('gpt') || model.includes('o1') || model.includes('o3')) {
-      return Math.floor(limit * 0.60)
-    }
-    if (limit >= 128_000) return Math.floor(limit * 0.60)
-    if (limit <= 32_000)  return Math.floor(limit * 0.50)
-    return Math.floor(limit * 0.55)
+
+    // Tier 4: Small models — 65% (STRING evidence still valid)
+    return Math.floor(limit * 0.65)
   })
 
   /**
-   * Reserved budget: tokens set aside for the model's own output.
+   * Reserved budget: tokens set aside for model output.
    *
-   * IMPORTANT (DeepSeek API docs, verified):
-   *   Thinking/reasoning tokens are part of completion_tokens (OUTPUT),
-   *   NOT prompt_tokens (INPUT). They do NOT consume the context window —
-   *   they consume the max_tokens output budget. The reasoning_content from
-   *   previous turns is stripped and NOT fed back into subsequent requests.
+   * IMPORTANT (DeepSeek API docs):
+   *   Thinking/reasoning tokens are completion_tokens (OUTPUT), NOT prompt_tokens.
+   *   They do NOT consume the context window — they consume max_tokens budget.
    *
-   *   So we only reserve for: model response + JSON overhead + safety.
+   * Dynamic: larger windows need proportionally LESS reserved.
+   *   1M window → 5% reserved = 42K (vast overkill for any single response)
+   *   128K window → 8% reserved = 8K (ample for tool-call + response)
+   *   Small window → 10% reserved
    */
   const contextReserved = computed(() => {
     const target = contextTarget.value
-    let r = Math.floor(target * 0.10)  // 10% base for model response
-    r += Math.floor(target * 0.05)     // 5% JSON framing + safety margin
-    return r
+    const limit = contextLimit.value
+    if (limit >= 500_000) return Math.floor(target * 0.05)
+    if (limit >= 128_000) return Math.floor(target * 0.08)
+    return Math.floor(target * 0.10)
   })
 
   /** Usable budget: what we can actually send (target minus reserved). */
@@ -1139,17 +1159,16 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const go = window.go.app.App
       // Estimate system prompt from enabled skills.
-      let sysPrompt = '你是 EverEvo 桌面软件的 AI 助手，遵循 ReAct（推理-行动）框架工作。\n\n## 工作流程\n1. 分析 → 2. 行动 → 3. 观察 → 4. 重复 → 5. 最终回答\n\n## 工具规则\n- 先思考再行动，失败换方案\n- JSON 提取关键字段，不要整套贴出\n- 不需要工具就直接回答\n\n## 其他\n- 用户说中文用中文回复'
+      let sysPrompt = '你是 EverEvo 桌面软件的 AI 助手，遵循 ReAct（推理-行动）框架工作。\n\n## 工具发现\n你只有核心工具（read_file、shell_exec、web_search、web_fetch、agent_run 等），其他工具需通过 tool_search 按需获取完整 Schema。\n- 使用 tool_search(query="关键词", category="类别") 搜索工具并获取参数定义\n- 可以先用空 query 或 "*" 查看所有工具类别，再按需搜索具体工具\n- 获取到的工具 Schema 在当前对话轮次内有效，可多次调用\n\n## 工作流程\n1. 分析需求 → 2. tool_search 发现工具 → 3. 调用工具 → 4. 观察结果 → 5. 重复直至完成\n\n## 输出规则\n- 工具结果为 JSON 时，只提取关键字段展示，不要照搬原始 JSON\n- 大文件读取会被自动截断（标注了截断位置），需要更多内容时重新读取指定 offset\n- 不需要工具就直接回答\n\n## 语言\n- 用户说中文用中文回复'
       const enabledSkills = await go.ListEnabledSkills(activeLibraryId.value).catch(() => [])
       for (const s of (enabledSkills || [])) {
         if (s.systemPrompt) sysPrompt += '\n【' + (s.title || '') + '】' + s.systemPrompt
       }
       _sysPromptTokens.value = estimateTokens(sysPrompt)
 
-      // Estimate tool definitions.
-      const toolNames = await go.GetEnabledToolNames().catch(() => [])
-      const allTools = await go.ListTools().catch(() => [])
-      const enabledTools = (allTools || []).filter((t: any) => toolNames.includes(t.name))
+      // Estimate tool definitions — use lazy (core) tools to match what's actually sent.
+      const allTools = await go.ListToolsLazy().catch(() => [])
+      const enabledTools = allTools || []
       _toolDefTokens.value = (enabledTools as any[]).reduce((sum: number, t: any) => {
         const fullDef = {
           type: 'function',
@@ -1161,8 +1180,8 @@ export const useChatStore = defineStore('chat', () => {
       _memRagTokens.value = 0 // no active recall during session load
     } catch (_) {
       // Conservative fallback
-      _sysPromptTokens.value = 4000
-      _toolDefTokens.value = 5000
+      _sysPromptTokens.value = 3000
+      _toolDefTokens.value = 1500
       _memRagTokens.value = 0
     }
   }
@@ -1462,7 +1481,7 @@ export const useChatStore = defineStore('chat', () => {
       try { enabledNames = (await go.GetEnabledToolNames()) || [] } catch (_) { enabledNames = [] }
 
       let allTools: ToolDef[]
-      try { allTools = (await go.ListTools()) || [] } catch (_) { allTools = [] }
+      try { allTools = (await go.ListToolsLazy()) || [] } catch (_) { allTools = [] }
 
       const isExternal = (n: string) => n.startsWith('mcp__')
       tools = allTools.filter(t => enabledNames.includes(t.name) || isExternal(t.name))
