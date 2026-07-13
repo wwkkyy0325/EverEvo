@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -343,7 +344,11 @@ func (a *App) WebSearch(query string) ([]map[string]any, error) {
 // WebFetch fetches a URL and extracts usable text content, stripping HTML when
 // detected. Optional prompt extracts a targeted excerpt (2KB around matching
 // keywords). Limits response body to 256KB.
-func (a *App) WebFetch(url, prompt string) (map[string]any, error) {
+func (a *App) WebFetch(url, prompt, depth string) (map[string]any, error) {
+	if depth == "" {
+		depth = "summary"
+	}
+
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	client := httpclient.New(15 * time.Second)
@@ -362,16 +367,75 @@ func (a *App) WebFetch(url, prompt string) (map[string]any, error) {
 	}
 	text = strings.TrimSpace(text)
 
+	// For large pages in summary mode, attempt LLM summarization via a
+	// lightweight provider to keep context impact minimal (Haiku-gate pattern).
+	originalSize := len(text)
+	if depth == "summary" && originalSize > 4096 {
+		if summary := a.trySummarizePage(url, text, prompt); summary != "" {
+			return map[string]any{
+				"url":            url,
+				"contentType":    contentType,
+				"text":           summary,
+				"size":           len(body),
+				"originalSize":   originalSize,
+				"summarized":     true,
+			}, nil
+		}
+	}
+
+	// Fallback: return truncated raw text (full mode or summarization unavailable).
+	if depth != "full" && len(text) > 8192 {
+		head := text[:4096]
+		tail := text[len(text)-2048:]
+		text = head + fmt.Sprintf("\n\n─── [页面内容截断: %d chars 总计. 使用 depth=full 获取完整内容] ───\n\n", len(text)) + tail
+	}
+
 	result := map[string]any{
 		"url":         url,
 		"contentType": contentType,
 		"text":        text,
 		"size":        len(body),
 	}
-	if prompt != "" {
+	if prompt != "" && depth != "summary" {
 		result["excerpt"] = excerptAround(text, prompt, 2048)
 	}
 	return result, nil
+}
+
+// trySummarizePage attempts to summarize page content using a lightweight LLM.
+// Returns "" if no suitable provider is available or summarization fails.
+func (a *App) trySummarizePage(url, content, prompt string) string {
+	prov, err := a.resolveExtractionProvider()
+	if err != nil || prov == nil {
+		return ""
+	}
+
+	// Cap content sent to summarizer at 32KB to stay within cheap model limits.
+	contentToSummarize := content
+	if len(contentToSummarize) > 32768 {
+		contentToSummarize = contentToSummarize[:32768]
+	}
+
+	sumPrompt := "Summarize this web page content concisely in Chinese (max 500 chars). Focus on key facts, data, and actionable information. Skip navigation, ads, and boilerplate."
+	if prompt != "" {
+		sumPrompt = fmt.Sprintf("Extract information relevant to this query from the web page: %s. Respond concisely in Chinese (max 500 chars). Only include information that answers the query.", prompt)
+	}
+
+	msgs := []map[string]string{
+		{"role": "user", "content": fmt.Sprintf("URL: %s\n\nContent:\n%s\n\n---\n%s", url, contentToSummarize, sumPrompt)},
+	}
+	msgsJSON, _ := json.Marshal(msgs)
+
+	t := 0.1
+	resp, err := a.chatCompletion(prov, msgsJSON, nil, chatOpts{MaxTokens: 600, Temperature: &t})
+	if err != nil {
+		return ""
+	}
+
+	if text := extractChatText(resp); text != "" {
+		return text
+	}
+	return ""
 }
 
 // stripHTML removes all HTML tags and decodes common entities.

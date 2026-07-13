@@ -17,11 +17,7 @@ import (
 
 // ZonesDir returns the root directory containing all zone directories.
 func ZonesDir() string {
-	appDir, err := storage.RootAppDataDir()
-	if err != nil {
-		appDir = filepath.Join(os.Getenv("APPDATA"), "EverEvo")
-	}
-	return filepath.Join(appDir, "zones")
+	return filepath.Join(storage.DataDir(), "zones")
 }
 
 // Dir returns the filesystem path for a named zone.

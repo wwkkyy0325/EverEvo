@@ -30,11 +30,7 @@ var portsMu sync.Mutex
 
 // portRegistryPath returns the path to the shared port registry file.
 func portRegistryPath() string {
-	appDir, err := storage.RootAppDataDir()
-	if err != nil {
-		appDir = filepath.Join(os.Getenv("APPDATA"), "EverEvo")
-	}
-	return filepath.Join(appDir, "port_registry.json")
+	return filepath.Join(storage.DataDir(), "port_registry.json")
 }
 
 // loadPorts reads the port allocation registry from disk.

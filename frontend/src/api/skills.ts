@@ -62,6 +62,7 @@ export const skillsApi = {
   // Tools
   getEnabledToolNames() { return call<string[]>(() => App().GetEnabledToolNames()) },
   listTools() { return call<any[]>(() => App().ListTools()) },
+  listToolsLazy() { return call<any[]>(() => App().ListToolsLazy()) },
   callTool(name: string, args: Record<string, any>) { return call<any>(() => App().CallTool(name, args)) },
 
   // Guides

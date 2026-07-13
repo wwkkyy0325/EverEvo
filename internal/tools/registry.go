@@ -109,6 +109,25 @@ func RegisterAll() {
 	registerCollabTools()
 	registerPlanTools()
 	registerTaskBoardTools()
+	registerContextTools()
+}
+
+// registerContextTools registers context-management meta-tools.
+func registerContextTools() {
+	Register(&ToolDef{
+		Name:        "tool_search",
+		Title:       "搜索工具",
+		Description: "搜索可用的工具并返回匹配的完整 Schema。使用此工具发现和获取工具的详细参数定义，而不是依赖预先加载的工具列表。query 为空或 '*' 时返回所有工具，category 可限定工具类别",
+		Category:    "system",
+		Annotations: &ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true},
+		Parameters: &ToolParams{
+			Type: "object",
+			Properties: map[string]ToolProp{
+				"query":    {Type: "string", Description: "搜索关键词（中英文均可），匹配工具名称、标题和描述。空字符串或 '*' 返回全部"},
+				"category": {Type: "string", Description: "限定工具类别：model/plugin/kb/catalog/download/system/toolbox/guide/workflow/mcp/provider/a2a/agent/external"},
+			},
+		},
+	})
 }
 
 // ─── helpers ────────────────────────────────────────────────────

@@ -158,12 +158,32 @@ func (a *App) buildAgentToolNames(agent *agents.Agent) []string {
 // resolveAgentToolDefs builds the callable ToolDef list for an agent.
 //
 // Tool inclusion rules:
-//   - Built-in tools in the agent's allowed set (skills + explicit Tools).
+//   - For sub-agents (excludeOrchestration=true): ONLY core tools + tool_search.
+//     The agent discovers additional tools via tool_search on demand. This keeps
+//     sub-agent baseline context under ~5k tokens vs ~35k+ for full tool loading.
+//   - For main agents: the agent's allowed set (skills + explicit Tools) filtered
+//     from the full registry.
 //   - MCP tools: if the agent declares an explicit MCPTools list, ONLY those are
-//     granted (whitelist enforced). Otherwise (InheritSkills or none declared)
-//     all external MCP tools are included (matching main-chat behavior).
-//   - excludeOrchestration: strip orchestration/dangerous tools (sub-agents).
+//     granted (whitelist enforced). Otherwise all external MCP tools are included.
 func (a *App) resolveAgentToolDefs(agent *agents.Agent, excludeOrchestration bool) []*tools.ToolDef {
+	// Sub-agents always use lazy tool loading — only core tools + tool_search.
+	// Full schemas are fetched on-demand, saving ~85-95% baseline token overhead.
+	if excludeOrchestration {
+		core := tools.CoreToolsDef()
+		// Also grant the agent's explicitly allowed tools as cached schemas
+		allowed := map[string]bool{}
+		for _, n := range a.buildAgentToolNames(agent) {
+			allowed[n] = true
+		}
+		for _, t := range tools.List() {
+			if allowed[t.Name] && !tools.IsCoreTool(t.Name) && !tools.IsOrchestrationTool(t.Name) {
+				tools.CacheSchema(t)
+				core = append(core, t)
+			}
+		}
+		return core
+	}
+
 	allowed := map[string]bool{}
 	for _, n := range a.buildAgentToolNames(agent) {
 		allowed[n] = true

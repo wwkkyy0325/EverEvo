@@ -2,6 +2,32 @@
 
 > Append-only record of meaningful changes to EverEvo. Newest entry at the top.
 
+## 2026-07-13 — 上下文优化架构设计（Context Window Optimization）
+
+**Why:** 当前 ~110 工具全部 upfront 注册 → ~27k tokens/request 固定开销，工具输出无截断、子代理继承全量上下文。对标 Claude Code ToolSearch（134k→5k，95% 削减）、MCP 层级化工具管理、CMU JIT Schema Passing 等 2025 业界实践。
+
+**Design (not yet implemented):**
+- *三层上下文模型*: L1 轻量工具索引（300 tokens）+ 6 核心工具（800 tokens）；L2 按需 schema 加载 via `tool_search`；L3 工具输出自动截断 + 消费后压缩
+- *工具输出压缩*: 按工具定义 `OutputPolicy`（head+tail+marker），消费后替换为摘要标记
+- *子代理隔离*: 仅继承 agent 配置的 Tools+Skills 子集，baseline <5k tokens
+- *WebFetch 门控*: 轻量模型先读后摘要，原始 HTML 不入主上下文
+
+详见 [tasks/context-optimization.md](tasks/context-optimization.md)
+
+## 2026-07-13 — 存储层纯便携化（Portable-Only Refactoring）
+
+**Why:** EverEvo 始终以源码形式分发（自进化需要编译能力），不存在独立 EXE 发行场景。原有的 Portable/User 双模式 + AppData 迁移层是多余的。
+
+**Changes:**
+- *storage*: 移除 `IsPortable()` / `appDataRoot()` / `OldAppDataDir()` / `MigrateLegacyData()` / `RootAppDataDir()` 及所有 legacy fallback；新增 `PythonDir()`；`DataDir()`/`RuntimeDir()` 始终从项目根解析
+- *config*: 移除全部迁移代码（`migrateLegacyConfig` / `migrateAllData` / `migrateOldLLM` / `backupZoneData` 等 ~170 行）；移除 `GlobalPath()`（无调用者）；简化 `Load()`/`Path()`
+- *zone*: `ZonesDir()`/`portRegistryPath()` 直接使用 `storage.DataDir()`，移除 `RootAppDataDir()` 中间层；更新包文档
+- *backends*: `detectPython()` 便携路径从 `%APPDATA%/EverEvo/python/` → `runtime/python/`；移除 `appDataPath()`
+- *app.go*: 移除双模式日志和 `MigrateLegacyData()` 调用
+- *docs*: 更新 design.md 配置路径描述
+
+**Net:** ~300 行代码净删除，零新增逻辑。
+
 ## 2026-07-11 — 领域即容器 v2 实施（Phase 0–5）
 
 **Why:** 领域化是将 `domain_libraries` 从松散标签升格为架构级强制容器的核心重构。基于 [domain-refactor-v2.md](tasks/domain-refactor-v2.md) 的完整设计，结合 25+ 篇学术论文（CoALA/MemGPT/IsolateGPT/PC-RAG等）的业界共识。

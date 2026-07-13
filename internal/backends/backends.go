@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"everevo/internal/httpclient"
+	"everevo/internal/storage"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -300,9 +301,8 @@ func detectPython(spec BackendSpec) Status {
 
 	var found []PythonInfo
 
-	// 1. Portable Python (our managed installation in AppData)
-	appData, _ := appDataPath()
-	portableExe := filepath.Join(appData, "EverEvo", "python", "python.exe")
+	// 1. Portable Python (our managed installation under runtime/)
+	portableExe := filepath.Join(storage.PythonDir(), "python.exe")
 	if ver := pythonVersion(portableExe); ver != "" {
 		found = append(found, PythonInfo{Path: portableExe, Version: ver, Source: "portable"})
 	}
@@ -406,18 +406,6 @@ func pythonVersion(exe string) string {
 		return ""
 	}
 	return strings.TrimPrefix(strings.TrimSpace(string(out)), "Python ")
-}
-
-// appDataPath returns %APPDATA% or equivalent.
-func appDataPath() (string, error) {
-	dir := os.Getenv("APPDATA")
-	if dir == "" {
-		dir = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Roaming")
-	}
-	if dir == "" {
-		return "", os.ErrNotExist
-	}
-	return dir, nil
 }
 
 func detectNodeJS(spec BackendSpec) Status {

@@ -145,28 +145,82 @@ func init() {
 
 		// ── download engine ──
 		"download_engine": hDownloadEngine,
+
+		// ── context: lazy tool discovery ──
+		"tool_search": hToolSearch,
 	}
 }
 
-// ListTools returns all LLM-callable tool definitions.
+// ─── Lazy tool discovery ─────────────────────────────────────────
+
+// hToolSearch implements the tool_search meta-tool for on-demand schema loading.
+// The LLM calls this to discover and fetch full tool schemas instead of having
+// all ~110 tool definitions loaded in every request.
+func hToolSearch(a *App, p map[string]any) tools.ToolResult {
+	query := tools.GetString(p, "query")
+	category := tools.GetString(p, "category")
+
+	results := tools.SearchTools(query, category)
+
+	// Cache fetched schemas for the remainder of this turn
+	for _, t := range results {
+		tools.CacheSchema(t)
+	}
+
+	type searchResult struct {
+		Query    string          `json:"query"`
+		Category string          `json:"category,omitempty"`
+		Tools    []*tools.ToolDef `json:"tools"`
+		Count    int             `json:"count"`
+		Hint     string          `json:"hint,omitempty"`
+	}
+
+	sr := searchResult{
+		Query: query,
+		Category: category,
+		Tools: results,
+		Count: len(results),
+	}
+	if len(results) == 0 {
+		sr.Hint = "No tools matched. Try a broader query, use '*' to list all, or specify a category."
+	} else if len(results) >= 15 {
+		sr.Hint = "Results capped at 15. Use a more specific query or category filter for narrower results."
+	}
+
+	return tools.OkResult(sr)
+}
+
+// ListTools returns all LLM-callable tool definitions (for MCP tools/list).
 func (a *App) ListTools() []*tools.ToolDef { return tools.List() }
 
+// ListToolsLazy returns core tools only — the lightweight set sent to the LLM
+// in every request. Full tool schemas are fetched on-demand via tool_search.
+func (a *App) ListToolsLazy() []*tools.ToolDef { return tools.CoreToolsDef() }
+
 // CallTool dispatches a named tool call from the LLM to the appropriate backend method.
+// Tool results are automatically truncated per the tool's OutputPolicy.
 func (a *App) CallTool(name string, params map[string]any) tools.ToolResult {
+	var result tools.ToolResult
 	if h, ok := toolHandlers[name]; ok {
-		return h(a, params)
-	}
-	// Fallback: try external MCP server tools
-	if tools.IsExternal(name) && a.mcpClient != nil {
-		result, err := a.mcpClient.CallTool(name, params)
+		result = h(a, params)
+	} else if tools.IsExternal(name) && a.mcpClient != nil {
+		// Fallback: try external MCP server tools
+		r, err := a.mcpClient.CallTool(name, params)
 		if err != nil {
 			return tools.ErrResult(err)
 		}
-		if result != nil {
-			return *result
+		if r != nil {
+			result = *r
 		}
+	} else {
+		return tools.ErrMsg("未知工具: " + name)
 	}
-	return tools.ErrMsg("未知工具: " + name)
+
+	// Apply output truncation for large results
+	if compacted, did := tools.CompactResult(name, result); did {
+		return compacted
+	}
+	return result
 }
 
 // ─── Model handlers ───────────────────────────────────────────
@@ -840,7 +894,8 @@ func hWebFetch(a *App, p map[string]any) tools.ToolResult {
 		return tools.ErrMsg("缺少必填参数: url")
 	}
 	prompt := tools.GetString(p, "prompt")
-	result, err := a.WebFetch(url, prompt)
+	depth := tools.GetString(p, "depth") // "summary" | "detailed" | "full"; default "summary"
+	result, err := a.WebFetch(url, prompt, depth)
 	if err != nil {
 		return tools.ErrResult(err)
 	}

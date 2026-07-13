@@ -177,22 +177,13 @@ func (a *App) Startup(ctx context.Context) {
 		log.Printf("已加载 %s 凭证", src)
 	}
 
-	if storage.IsPortable() {
-		log.Printf("运行模式: 便携版 (项目根目录: %s)", storage.ProjectRoot())
-	} else {
-		log.Println("运行模式: 用户模式 (数据目录: %APPDATA%/EverEvo)")
-	}
+	log.Printf("项目根目录: %s", storage.ProjectRoot())
 
 	if err := storage.EnsureDirs(); err != nil {
-		log.Printf("⚠ 创建数据目录失败: %v", err)
-	} else {
-		// Migrate legacy data from EXE-relative paths to APPDATA.
-		storage.MigrateLegacyData()
-		dir := storage.DataDir()
-		modelsDir := storage.ModelsDir()
-		log.Printf("数据目录: %s", dir)
-		log.Printf("模型目录: %s", modelsDir)
+		log.Printf("创建数据目录失败: %v", err)
 	}
+	log.Printf("数据目录: %s", storage.DataDir())
+	log.Printf("模型目录: %s", storage.ModelsDir())
 
 	// 尝试初始化 ONNX Runtime（如果已安装）
 	onnxDLL, _ := findONNXDLL()

@@ -1,7 +1,7 @@
 // Package zone provides runtime-zone isolation for EverEvo instances.
 //
-// Each instance runs in a named "zone" under %APPDATA%/EverEvo/zones/<name>/.
-// Zones are one of three types:
+// Each instance runs in a named "zone" under data/zones/<name>/ relative to the
+// project root. Zones are one of three types:
 //   - production: the live/stable instance (default)
 //   - experiment: a sandboxed copy for testing self-modifications
 //   - backup: a snapshot of production before a merge
