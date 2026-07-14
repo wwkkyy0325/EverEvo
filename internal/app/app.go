@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -18,10 +19,12 @@ import (
 	"everevo/internal/backends/onnx"
 	"everevo/internal/catalog"
 	"everevo/internal/config"
+	"everevo/internal/core"
 	"everevo/internal/downloader"
 	"everevo/internal/guides"
 	"everevo/internal/httpclient"
 	"everevo/internal/memory"
+	"everevo/internal/rag"
 	"everevo/internal/model"
 	"everevo/internal/storage"
 	"everevo/internal/sysinfo"
@@ -31,7 +34,10 @@ import (
 	"everevo/internal/a2a"
 	"everevo/internal/acp"
 	"everevo/internal/agents"
+	agentPlugin "everevo/internal/plugins/tools/agents"
 	"everevo/internal/async"
+	evolvePlugin "everevo/plugins/tools/evolve"
+	modelsPlugin "everevo/internal/plugins/tools/models"
 	"everevo/internal/collab"
 	"everevo/internal/feishu"
 	"everevo/internal/mcp"
@@ -57,8 +63,9 @@ type App struct {
 	mcpClient       *mcpclient.Manager
 	a2aManager      *a2a.Manager
 	feishuClient    *feishu.Client
-	skillManager    *skills.Manager
-	agentManager    *agents.Manager
+	skillManager     *skills.Manager
+	paradigmManager  *memory.ParadigmManager
+	agentManager     *agents.Manager
 	memoryStore     *memory.Store
 	guideManager    *guides.Manager
 	workflowManager *workflow.Manager
@@ -223,9 +230,17 @@ func (a *App) Startup(ctx context.Context) {
 	}
 	log.Println("模型管理器就绪")
 
+	// Wire models plugin with App infrastructure (catalog/download logic).
+	modelsPlugin.SetBackend(a)
+	log.Println("模型插件后端已接入")
+
 	// Register all LLM-callable tools
 	tools.RegisterAll()
 	log.Printf("已注册 %d 个 LLM 工具", len(tools.List()))
+
+	// Build plugin tool dispatch map so CallTool can route migrated tools
+	// through core.ToolPlugin instances (model/catalog/download/provider/plugin ops).
+	BuildPluginToolMap()
 
 	// Initialize skill manager
 	a.skillManager = skills.NewManager()
@@ -236,6 +251,9 @@ func (a *App) Startup(ctx context.Context) {
 
 	// Initialize local agent manager (personas) — ensures a default main agent exists
 	a.agentManager = agents.NewManager()
+		a.paradigmManager = memory.NewParadigmManager()
+		log.Printf("已加载 %d 个思维范式", len(a.paradigmManager.List()))
+
 	log.Printf("已加载 %d 个本地 Agent", len(a.agentManager.List()))
 
 	// Initialize collaboration kernel (event bus, blackboard, dispatcher).
@@ -314,6 +332,16 @@ func (a *App) Startup(ctx context.Context) {
 		}
 	}
 
+		// Register memory as a core.MemoryPlugin so the Engine can discover it.
+		mp := memory.NewMemoryPlugin(a.memoryStore, func(ctx context.Context, text string) ([]float32, error) {
+			dir := a.memoryStore.EmbeddingModelDir()
+			if dir == "" {
+				return nil, fmt.Errorf("no embedding model configured")
+			}
+			return rag.EmbedQuery(dir, text)
+		})
+		core.GlobalMemories.Register("memory", mp, mp.Manifest())
+
 	// P5: compute hardware-adaptive memory policy (RAM/disk → tier → params).
 	a.applyMemoryPolicy()
 
@@ -373,9 +401,34 @@ func (a *App) Startup(ctx context.Context) {
 			}
 		}
 	}
+	// Wire agent execution plugin with all runtime dependencies.
+	agentPlugin.SetDeps(&agentPlugin.Deps{
+		Cfg:          a.cfg,
+		SkillManager: a.skillManager,
+		AgentManager: a.agentManager,
+		MemoryStore:  a.memoryStore,
+		MCPClient:    a.mcpClient,
+		ChatCompletion: func(p *config.LLMProvider, messagesJSON, toolsJSON json.RawMessage, opts agentPlugin.ChatOpts) (map[string]any, error) {
+			return a.chatCompletion(p, messagesJSON, toolsJSON, chatOpts{
+				Temperature: opts.Temperature,
+				MaxTokens:   opts.MaxTokens,
+				ThinkEffort: opts.ThinkEffort,
+				OnChunk:     opts.OnChunk,
+				Ctx:         opts.Ctx,
+			})
+		},
+		CallTool: a.CallTool,
+		Collab:   a.collab,
+	})
+	log.Println("Agent 执行插件已就绪")
+
 	// Initialize OpenCode ACP bridge for code modification delegation.
 	a.acpBridge = acp.NewBridge(acp.DefaultExe)
 	log.Println("ACP 桥接就绪 (OpenCode)")
+
+	// Wire the evolve plugin (build, swap, ACP, sandbox).
+	evolvePlugin.New(evolveDelegate{a})
+	log.Println("进化插件已就绪")
 
 	// Auto-resume ACP evolve tasks that were interrupted mid-flight.
 	a.ResumeAcpEvolveTasks()
@@ -745,3 +798,11 @@ func (a *App) Shutdown(ctx context.Context) {
 	}
 	log.Println("应用已关闭")
 }
+// evolveDelegate adapts *App to evolvePlugin.Delegate, providing the source
+// directory and ACP bridge that the evolve plugin needs.
+type evolveDelegate struct {
+	a *App
+}
+
+func (d evolveDelegate) SourceDir() string      { return d.a.sourceDir }
+func (d evolveDelegate) AcpBridge() *acp.Bridge { return d.a.acpBridge }

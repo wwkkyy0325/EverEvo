@@ -10,6 +10,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -131,15 +133,45 @@ func NewStore(libraryID string) (*Store, error) {
 	if libraryID == "" {
 		wikiDir = filepath.Join(base, "wiki")
 	}
-	cdb, err := chromem.NewPersistentDB(filepath.Join(wikiDir, "chromem"), false)
+	// Ensure the wiki directory exists before chromem tries to write into it.
+	if err := os.MkdirAll(wikiDir, 0755); err != nil {
+		return nil, fmt.Errorf("wiki: create dir %s: %w", wikiDir, err)
+	}
+	chromemDir := filepath.Join(wikiDir, "chromem")
+	cdb, err := chromem.NewPersistentDB(chromemDir, false)
 	if err != nil {
-		return nil, err
+		// A partially-written chromem metadata file (e.g. after a crash) can
+		// cause persistent failures. Remove the corrupted directory and retry
+		// once — data will be repopulated by the next WikiReindex.
+		if strings.Contains(err.Error(), "metadata file not found") {
+			log.Printf("[wiki] chromem recovery: removing %s and retrying", chromemDir)
+			os.RemoveAll(chromemDir)
+			cdb, err = chromem.NewPersistentDB(chromemDir, false)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	col := cdb.GetCollection(collection, nil)
 	if col == nil {
 		col, err = cdb.CreateCollection(collection, nil, nil)
 		if err != nil {
-			return nil, err
+			// Same recovery for CreateCollection failures (stale .gob files
+			// without metadata — see chromem-go persistToFile race).
+			if strings.Contains(err.Error(), "metadata file not found") {
+				log.Printf("[wiki] chromem collection recovery: removing %s and retrying", chromemDir)
+				os.RemoveAll(chromemDir)
+				cdb2, cdbErr := chromem.NewPersistentDB(chromemDir, false)
+				if cdbErr == nil {
+					col, err = cdb2.CreateCollection(collection, nil, nil)
+					if err == nil {
+						cdb = cdb2
+					}
+				}
+			}
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	sdb, err := sql.Open("sqlite", filepath.Join(wikiDir, "wiki.db"))

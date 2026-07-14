@@ -2,6 +2,11 @@
 // Every functional interface in the app is encapsulated as a Tool with
 // JSON Schema parameters, compatible with OpenAI/Anthropic function calling
 // and the MCP (Model Context Protocol) tools/list specification.
+//
+// Deprecated: This is the legacy tool system. New tools should implement
+// core.ToolPlugin and self-register via core.GlobalTools.Register() in init().
+// Tool dispatch in CallTool() checks the new plugin engine first, so migrated
+// tools automatically take priority over legacy handlers.
 package tools
 
 import "encoding/json"

@@ -170,4 +170,17 @@ export const memoryApi = {
   libraryUpdate(id: string, name: string, description: string, icon: string) { return call(() => App().LibraryUpdate(id, name, description, icon)) },
   libraryBumpUse(id: string) { return call(() => App().LibraryBumpUse(id)) },
   libraryMerge(keepId: string, dropId: string) { return call(() => App().LibraryMerge(keepId, dropId)) },
+
+  // ── Thinking Paradigm Library (P10) ──
+  paradigmList(libraryId = '') { return call<any[]>(() => App().ParadigmList(libraryId)) },
+  paradigmGet(id: string) { return call<any>(() => App().ParadigmGet(id)) },
+  paradigmAdd(p: any) { return call<any>(() => App().ParadigmAdd(p)) },
+  paradigmUpdate(id: string, p: any) { return call(() => App().ParadigmUpdate(id, p)) },
+  paradigmDelete(id: string) { return call(() => App().ParadigmDelete(id)) },
+  paradigmToggle(id: string, enabled: boolean) { return call(() => App().ParadigmToggle(id, enabled)) },
+  paradigmFeedback(id: string, match: number, exec: number, outcome: number, reason: string) { return call(() => App().ParadigmFeedback(id, match, exec, outcome, reason)) },
+  paradigmSelect(id: string) { return call<string>(() => App().ParadigmSelect(id)) },
+  paradigmRefine(id: string) { return call<any>(() => App().ParadigmRefine(id)) },
+  paradigmDistill(text: string, workspaceId: string) { return call<any>(() => App().ParadigmDistill(text, workspaceId)) },
+  paradigmMatch(task: string) { return call<any[]>(() => App().ParadigmMatch(task)) },
 }

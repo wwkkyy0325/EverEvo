@@ -129,6 +129,7 @@ const navItems = [
   { route: 'image-classifier', icon: '◫', label: '图像分类' },
   { route: 'memory', icon: '🧠', label: '记忆' },
   { route: 'knowledge', icon: '◈', label: '领域' },
+  { route: 'paradigm', icon: '🧠', label: '思维范式' },
   { route: 'guides', icon: '☰', label: '攻略' },
   { route: 'plugins', icon: '⊕', label: '插件' },
   { route: 'capability', icon: '◎', label: '大语言模型' },

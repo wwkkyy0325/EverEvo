@@ -3,6 +3,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"everevo/internal/a2a"
 	"everevo/internal/agents"
+	"everevo/internal/core"
 	"everevo/internal/guides"
 	mcpclient "everevo/internal/mcp/client"
 	"everevo/internal/tools"
@@ -25,26 +27,6 @@ var toolHandlers map[string]func(a *App, params map[string]any) tools.ToolResult
 
 func init() {
 	toolHandlers = map[string]func(a *App, params map[string]any) tools.ToolResult{
-		// ── model ──
-		"model_list":           hModelList,
-		"model_load":           hModelLoad,
-		"model_unload":         hModelUnload,
-		"model_run":            hModelRun,
-		"model_list_downloaded": hModelListDownloaded,
-		"model_list_tool":      hModelListTool,
-
-		// ── plugin ──
-		"plugin_list":    hPluginList,
-		"plugin_status":  hPluginStatus,
-		"plugin_start":   hPluginStart,
-		"plugin_stop":    hPluginStop,
-		"plugin_restart": hPluginRestart,
-		"plugin_run":     hPluginRun,
-		"plugin_install": hPluginInstall,
-		"plugin_delete":  hPluginDelete,
-		"plugin_logs":    hPluginLogs,
-		"plugin_create":  hPluginCreate,
-
 		// ── knowledge base ──
 		"kb_list":         hKBList,
 		"kb_create":       hKBCreate,
@@ -58,17 +40,7 @@ func init() {
 		"read_media_file":  hReadMediaFile,
 		"kb_delete_chunks": hKBDeleteChunks,
 
-		// ── catalog ──
-		"catalog_search":      hCatalogSearch,
-		"catalog_get_detail":  hCatalogDetail,
-		"catalog_list_files":  hCatalogFiles,
-		"catalog_set_token":   hCatalogSetToken,
-		"catalog_get_accounts": hCatalogAccounts,
-
-		// ── download ──
-		"download_file":       hDownloadFile,
-		"download_package":    hDownloadPackage,
-		"download_selected":   hDownloadSelected,
+		// ── download cleanup ──
 		"download_delete_file": hDownloadDeleteFile,
 		"download_delete_dir": hDownloadDeleteDir,
 
@@ -77,10 +49,6 @@ func init() {
 		"system_dynamic": hSystemDynamic,
 		"system_backends": hSystemBackends,
 		"system_config":   hSystemConfig,
-
-		// ── toolbox ──
-		"toolbox_list_models": hToolboxModels,
-		"toolbox_embed":       hToolboxEmbed,
 
 		// ── guide ──
 		"guide_list":    hGuideList,
@@ -125,13 +93,6 @@ func init() {
 		"agent_synthesize_tool":         hAgentSynthesizeTool,
 		"agent_set_library":             hAgentSetLibrary,
 
-		// ── provider ──
-		"provider_list":        hProviderList,
-		"provider_get_active":  hProviderGetActive,
-		"provider_set_active":  hProviderSetActive,
-		"provider_test":        hProviderTest,
-		"provider_list_presets": hProviderListPresets,
-
 		// ── proxy ──
 		"proxy_get":    hProxyGet,
 		"proxy_set":    hProxySet,
@@ -143,11 +104,15 @@ func init() {
 		"web_search":      hWebSearch,
 		"web_fetch":       hWebFetch,
 
-		// ── download engine ──
-		"download_engine": hDownloadEngine,
-
 		// ── context: lazy tool discovery ──
 		"tool_search": hToolSearch,
+		// ── paradigm ──
+		"paradigm_list":     hParadigmList,
+		"paradigm_select":   hParadigmSelect,
+		"paradigm_feedback": hParadigmFeedback,
+		"paradigm_refine":    hParadigmRefine,
+		"paradigm_distill":   hParadigmDistill,
+		"paradigm_match":     hParadigmMatch,
 	}
 }
 
@@ -197,11 +162,64 @@ func (a *App) ListTools() []*tools.ToolDef { return tools.List() }
 // in every request. Full tool schemas are fetched on-demand via tool_search.
 func (a *App) ListToolsLazy() []*tools.ToolDef { return tools.CoreToolsDef() }
 
+// ─── Plugin tool dispatch ────────────────────────────────────────
+
+// pluginToolMap maps tool names to core.ToolPlugin instances that handle them.
+// Populated at startup by BuildPluginToolMap(). When a tool name is found here,
+// CallTool dispatches through the plugin engine instead of the legacy toolHandlers.
+var pluginToolMap map[string]core.ToolPlugin
+
+// BuildPluginToolMap scans all registered core.ToolPlugin instances and indexes
+// their tools by name. Call once during startup after plugins have registered.
+func BuildPluginToolMap() {
+	pluginToolMap = map[string]core.ToolPlugin{}
+	for _, entry := range core.GlobalTools.List() {
+		tp, ok := entry.Plugin.(core.ToolPlugin)
+		if !ok {
+			continue
+		}
+		for _, td := range tp.ToolDefs() {
+			pluginToolMap[td.Name] = tp
+		}
+	}
+}
+
+// callToolViaPlugins tries to dispatch a tool call through registered core.ToolPlugin
+// instances. Returns the result and true if a plugin handled it, or zero/ false.
+// If a plugin indicates it is not yet wired (delegate not set), false is returned
+// so the caller can fall through to legacy handlers.
+func callToolViaPlugins(name string, params map[string]any) (tools.ToolResult, bool) {
+	if pluginToolMap == nil {
+		return tools.ToolResult{}, false
+	}
+	tp, ok := pluginToolMap[name]
+	if !ok {
+		return tools.ToolResult{}, false
+	}
+	result, err := tp.CallTool(context.Background(), name, params)
+	if err != nil {
+		return tools.ErrResult(err), true
+	}
+	// If the plugin is not wired yet, fall through to legacy handlers so
+	// tools continue to work while plugins are being gradually migrated.
+	if !result.Success && (strings.Contains(result.Error, "delegate not wired") ||
+		strings.Contains(result.Error, "not configured") ||
+		strings.Contains(result.Error, "service not configured")) {
+		return tools.ToolResult{}, false
+	}
+	data, _ := json.Marshal(result.Data)
+	return tools.ToolResult{Success: result.Success, Data: data, Error: result.Error}, true
+}
+
 // CallTool dispatches a named tool call from the LLM to the appropriate backend method.
+// Priority: plugin engine → legacy toolHandlers → external MCP server tools.
+// Unwired plugins fall through to legacy handlers for backward compatibility.
 // Tool results are automatically truncated per the tool's OutputPolicy.
 func (a *App) CallTool(name string, params map[string]any) tools.ToolResult {
 	var result tools.ToolResult
-	if h, ok := toolHandlers[name]; ok {
+	if tr, ok := callToolViaPlugins(name, params); ok {
+		result = tr
+	} else if h, ok := toolHandlers[name]; ok {
 		result = h(a, params)
 	} else if tools.IsExternal(name) && a.mcpClient != nil {
 		// Fallback: try external MCP server tools
@@ -221,167 +239,6 @@ func (a *App) CallTool(name string, params map[string]any) tools.ToolResult {
 		return compacted
 	}
 	return result
-}
-
-// ─── Model handlers ───────────────────────────────────────────
-
-func hModelList(a *App, _ map[string]any) tools.ToolResult {
-	return tools.OkResult(a.ListModels())
-}
-
-func hModelLoad(a *App, p map[string]any) tools.ToolResult {
-	id, n, mp := tools.GetString(p, "id"), tools.GetString(p, "name"), tools.GetString(p, "modelPath")
-	if id == "" || n == "" || mp == "" {
-		return tools.ErrMsg("缺少必填参数: id, name, modelPath")
-	}
-	info, err := a.LoadModelFile(id, n, mp)
-	if err != nil {
-		return tools.ErrResult(err)
-	}
-	return tools.OkResult(info)
-}
-
-func hModelUnload(a *App, p map[string]any) tools.ToolResult {
-	if id := tools.GetString(p, "id"); id != "" {
-		return tools.OkResult(a.UnloadModel(id))
-	}
-	return tools.ErrMsg("缺少必填参数: id")
-}
-
-func hModelRun(a *App, p map[string]any) tools.ToolResult {
-	id, input := tools.GetString(p, "id"), tools.GetString(p, "input")
-	if id == "" || input == "" {
-		return tools.ErrMsg("缺少必填参数: id, input")
-	}
-	out, err := a.RunModel(id, input)
-	if err != nil {
-		return tools.ErrResult(err)
-	}
-	return tools.OkResult(map[string]string{"output": out})
-}
-
-func hModelListDownloaded(a *App, _ map[string]any) tools.ToolResult {
-	return tools.OkResult(a.ListDownloadedModels())
-}
-
-func hModelListTool(a *App, _ map[string]any) tools.ToolResult {
-	return tools.OkResult(a.ListToolModels())
-}
-
-// ─── Plugin handlers ──────────────────────────────────────────
-
-func hPluginList(a *App, _ map[string]any) tools.ToolResult {
-	list, err := a.ListPlugins()
-	if err != nil {
-		return tools.ErrResult(err)
-	}
-	return tools.OkResult(list)
-}
-
-func hPluginStatus(a *App, p map[string]any) tools.ToolResult {
-	name := tools.GetString(p, "name")
-	if name != "" {
-		return tools.OkResult(a.GetPluginStatus(name))
-	}
-	// No name → return all plugin statuses (a bare status call shouldn't fail).
-	return tools.OkResult(map[string]any{
-		"all":     a.getPluginHost().ListStatus(),
-		"hint":    "未指定 name，返回所有插件状态",
-	})
-}
-
-func hPluginStart(a *App, p map[string]any) tools.ToolResult {
-	return tools.OkResult(a.StartPlugin(tools.GetString(p, "name")))
-}
-
-func hPluginStop(a *App, p map[string]any) tools.ToolResult {
-	return tools.OkResult(a.StopPlugin(tools.GetString(p, "name")))
-}
-
-func hPluginRestart(a *App, p map[string]any) tools.ToolResult {
-	return tools.OkResult(a.RestartPlugin(tools.GetString(p, "name")))
-}
-
-func hPluginRun(a *App, p map[string]any) tools.ToolResult {
-	name, method := tools.GetString(p, "name"), tools.GetString(p, "method")
-	if name == "" || method == "" {
-		return tools.ErrMsg("缺少必填参数: name, method")
-	}
-	params, _ := p["params"].(map[string]any)
-	out, err := a.RunPlugin(name, method, params)
-	if err != nil {
-		// Attach diagnostics so timeouts aren't a black box: include the
-		// process status + recent stderr (Python tracebacks / startup errors
-		// land here). This is the difference between "请求超时" and knowing
-		// the plugin crashed on import or never read stdin.
-		status := a.GetPluginStatus(name)
-		logs := a.GetPluginLogs(name)
-		diag := map[string]any{
-			"running": status.Running,
-			"pid":     status.PID,
-			"error":   err.Error(),
-		}
-		if status.Error != "" {
-			diag["statusError"] = status.Error
-		}
-		if strings.TrimSpace(logs) != "" {
-			tail := logs
-			if len(tail) > 1500 {
-				tail = "…" + tail[len(tail)-1500:]
-			}
-			diag["stderr"] = tail
-		} else {
-			diag["stderr"] = "(空 — 插件未输出任何日志，可能 Python 启动即崩溃或 stdio 通道断开)"
-		}
-		return tools.ErrResult(fmt.Errorf("插件 %s.%s 调用失败: %w\n诊断: %s", name, method, err, asJSON(diag)))
-	}
-	return tools.OkResult(out)
-}
-
-// asJSON is a tiny helper for embedding structured diagnostics in error text.
-func asJSON(v any) string {
-	b, _ := json.Marshal(v)
-	return string(b)
-}
-
-func hPluginInstall(a *App, p map[string]any) tools.ToolResult {
-	path := tools.GetString(p, "path")
-	if path == "" {
-		return tools.ErrMsg("缺少必填参数: path")
-	}
-	spec, err := a.InstallPlugin(path)
-	if err != nil {
-		return tools.ErrResult(err)
-	}
-	return tools.OkResult(spec)
-}
-
-func hPluginDelete(a *App, p map[string]any) tools.ToolResult {
-	return tools.OkResult(a.DeletePlugin(tools.GetString(p, "name")))
-}
-
-func hPluginLogs(a *App, p map[string]any) tools.ToolResult {
-	return tools.OkResult(map[string]string{"logs": a.GetPluginLogs(tools.GetString(p, "name"))})
-}
-
-func hPluginCreate(a *App, p map[string]any) tools.ToolResult {
-	name := tools.GetString(p, "name")
-	runtime := tools.GetString(p, "runtime")
-	code := tools.GetString(p, "code")
-	desc := tools.GetString(p, "description")
-	methods := tools.GetString(p, "methods")
-	deps := tools.GetString(p, "dependencies")
-	autoStart := true
-	if v, ok := p["autoStart"]; ok {
-		if b, ok := v.(bool); ok {
-			autoStart = b
-		}
-	}
-	result, err := a.PluginCreate(name, runtime, desc, code, methods, deps, autoStart)
-	if err != nil {
-		return tools.ErrResult(err)
-	}
-	return tools.OkResult(result)
 }
 
 // ─── KB handlers ──────────────────────────────────────────────
@@ -503,75 +360,6 @@ func hKBDeleteChunks(a *App, p map[string]any) tools.ToolResult {
 	return tools.OkResult(map[string]int{"deleted": n})
 }
 
-// ─── Catalog handlers ─────────────────────────────────────────
-
-func hCatalogSearch(a *App, p map[string]any) tools.ToolResult {
-	return tools.OkResult(a.SearchAllCatalog(tools.GetString(p, "query"), nil))
-}
-
-func hCatalogDetail(a *App, p map[string]any) tools.ToolResult {
-	src, repo := tools.GetString(p, "source"), tools.GetString(p, "repoId")
-	if src == "" || repo == "" {
-		return tools.ErrMsg("缺少必填参数: source, repoId")
-	}
-	return tools.OkResult(a.GetModelDetail(src, repo))
-}
-
-func hCatalogFiles(a *App, p map[string]any) tools.ToolResult {
-	return tools.OkResult(a.ListModelFiles(tools.GetString(p, "source"), tools.GetString(p, "repoId")))
-}
-
-func hCatalogSetToken(a *App, p map[string]any) tools.ToolResult {
-	src, tok := tools.GetString(p, "source"), tools.GetString(p, "token")
-	if src == "" {
-		return tools.ErrMsg("缺少必填参数: source")
-	}
-	return tools.OkResult(a.SetAccountToken(src, tok))
-}
-
-func hCatalogAccounts(a *App, _ map[string]any) tools.ToolResult {
-	return tools.OkResult(a.GetAccounts())
-}
-
-// ─── Download handlers ────────────────────────────────────────
-
-func hDownloadFile(a *App, p map[string]any) tools.ToolResult {
-	src, repo, file := tools.GetString(p, "source"), tools.GetString(p, "repoId"), tools.GetString(p, "filename")
-	if src == "" || repo == "" || file == "" {
-		return tools.ErrMsg("缺少必填参数: source, repoId, filename")
-	}
-	dlID, err := a.DownloadModelFile(src, repo, file)
-	if err != nil {
-		return tools.ErrResult(err)
-	}
-	return tools.OkResult(map[string]string{"downloadId": dlID})
-}
-
-func hDownloadPackage(a *App, p map[string]any) tools.ToolResult {
-	src, repo := tools.GetString(p, "source"), tools.GetString(p, "repoId")
-	if src == "" || repo == "" {
-		return tools.ErrMsg("缺少必填参数: source, repoId")
-	}
-	dlID, err := a.DownloadModelPackage(src, repo)
-	if err != nil {
-		return tools.ErrResult(err)
-	}
-	return tools.OkResult(map[string]string{"downloadId": dlID})
-}
-
-func hDownloadSelected(a *App, p map[string]any) tools.ToolResult {
-	src, repo := tools.GetString(p, "source"), tools.GetString(p, "repoId")
-	files := tools.GetStringSlice(p, "files")
-	if src == "" || repo == "" || len(files) == 0 {
-		return tools.ErrMsg("缺少必填参数: source, repoId, files")
-	}
-	dlID, err := a.DownloadSelectedFiles(src, repo, files)
-	if err != nil {
-		return tools.ErrResult(err)
-	}
-	return tools.OkResult(map[string]string{"downloadId": dlID})
-}
-
 func hDownloadDeleteFile(a *App, p map[string]any) tools.ToolResult {
 	return tools.OkResult(a.DeleteDownloadedFile(tools.GetString(p, "relPath")))
 }
@@ -586,24 +374,6 @@ func hSystemInfo(a *App, _ map[string]any) tools.ToolResult    { return tools.Ok
 func hSystemDynamic(a *App, _ map[string]any) tools.ToolResult { return tools.OkResult(a.GetDynamicInfo()) }
 func hSystemBackends(a *App, _ map[string]any) tools.ToolResult { return tools.OkResult(a.GetBackends()) }
 func hSystemConfig(a *App, _ map[string]any) tools.ToolResult  { return tools.OkResult(a.GetConfig()) }
-
-// ─── Toolbox handlers ─────────────────────────────────────────
-
-func hToolboxModels(a *App, _ map[string]any) tools.ToolResult {
-	return tools.OkResult(a.ListToolModels())
-}
-
-func hToolboxEmbed(a *App, p map[string]any) tools.ToolResult {
-	modelDir, texts := tools.GetString(p, "modelDir"), tools.GetStringSlice(p, "texts")
-	if modelDir == "" || len(texts) == 0 {
-		return tools.ErrMsg("缺少必填参数: modelDir, texts")
-	}
-	embs, err := a.EmbedTexts(modelDir, texts)
-	if err != nil {
-		return tools.ErrResult(err)
-	}
-	return tools.OkResult(embs)
-}
 
 // ─── Guide handlers ───────────────────────────────────────────
 
@@ -832,28 +602,6 @@ func hMCPStatus(a *App, _ map[string]any) tools.ToolResult {
 	return tools.OkResult(a.GetMCPStatus())
 }
 
-// ─── Provider handlers ───────────────────────────────────────
-
-func hProviderList(a *App, _ map[string]any) tools.ToolResult {
-	return tools.OkResult(a.ListProviders())
-}
-func hProviderGetActive(a *App, _ map[string]any) tools.ToolResult {
-	p := a.GetActiveProvider()
-	if p == nil { return tools.OkResult(nil) }
-	return tools.OkResult(p)
-}
-func hProviderSetActive(a *App, p map[string]any) tools.ToolResult {
-	return tools.OkResult(a.SetActiveProvider(tools.GetString(p, "id")))
-}
-func hProviderTest(a *App, p map[string]any) tools.ToolResult {
-	msg, err := a.TestProviderConnection(tools.GetString(p, "id"))
-	if err != nil { return tools.ErrResult(err) }
-	return tools.OkResult(msg)
-}
-func hProviderListPresets(a *App, _ map[string]any) tools.ToolResult {
-	return tools.OkResult(a.ListPresets())
-}
-
 // ─── Proxy handlers ──────────────────────────────────────────
 
 func hProxyGet(a *App, _ map[string]any) tools.ToolResult {
@@ -920,16 +668,6 @@ func hShellExec(a *App, p map[string]any) tools.ToolResult {
 		return tools.ErrResult(err)
 	}
 	return tools.OkResult(result)
-}
-
-// ─── Download engine handler ─────────────────────────────────
-
-func hDownloadEngine(a *App, p map[string]any) tools.ToolResult {
-	key, mirror, variant := tools.GetString(p, "key"), tools.GetString(p, "mirror"), tools.GetString(p, "variant")
-	if key == "" { return tools.ErrMsg("缺少必填参数: key") }
-	dlID, err := a.DownloadEngineFile(key, mirror, variant)
-	if err != nil { return tools.ErrResult(err) }
-	return tools.OkResult(map[string]string{"downloadId": dlID})
 }
 
 // ─── A2A Agent handlers ─────────────────────────────────────────
@@ -1312,4 +1050,82 @@ func hAgentSetLibrary(a *App, p map[string]any) tools.ToolResult {
 	}
 	a.emitChanged("agents:changed", "update", agentID)
 	return tools.OkResult(map[string]string{"status": "ok"})
+}
+
+// ─── Paradigm tools ──────────────────────────────────────────────────────
+
+func hParadigmList(a *App, p map[string]any) tools.ToolResult {
+	libID := tools.GetString(p, "libraryId")
+	list, err := a.ParadigmList(libID)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(list)
+}
+
+func hParadigmSelect(a *App, p map[string]any) tools.ToolResult {
+	id := tools.GetString(p, "id")
+	methodology, err := a.ParadigmSelect(id)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(map[string]string{"methodology": methodology})
+}
+
+func hParadigmFeedback(a *App, p map[string]any) tools.ToolResult {
+	id := tools.GetString(p, "id")
+	matchQ := floatParam(p, "match", 0.5)
+	execQ := floatParam(p, "exec", 0.5)
+	outcomeQ := floatParam(p, "outcome", 0.5)
+	reason := tools.GetString(p, "reason")
+	if err := a.ParadigmFeedback(id, matchQ, execQ, outcomeQ, reason); err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(map[string]any{
+		"composite": matchQ*0.15 + execQ*0.45 + outcomeQ*0.40,
+		"hint":      "match=匹配度 exec=执行度 outcome=结果度，低match可能是任务不匹配而非范式本身问题",
+	})
+}
+
+func hParadigmRefine(a *App, p map[string]any) tools.ToolResult {
+	id := tools.GetString(p, "id")
+	result, err := a.ParadigmRefine(id)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
+}
+
+func hParadigmDistill(a *App, p map[string]any) tools.ToolResult {
+	text := tools.GetString(p, "text")
+	wsID := tools.GetString(p, "libraryId")
+	result, err := a.ParadigmDistill(text, wsID)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
+}
+
+func hParadigmMatch(a *App, p map[string]any) tools.ToolResult {
+	task := tools.GetString(p, "task")
+	list, err := a.ParadigmMatch(task)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(list)
+}
+
+func floatParam(p map[string]any, key string, def float64) float64 {
+	if v, ok := p[key]; ok {
+		switch n := v.(type) {
+		case float64:
+			return n
+		case int:
+			return float64(n)
+		case json.Number:
+			f, _ := n.Float64()
+			return f
+		}
+	}
+	return def
 }

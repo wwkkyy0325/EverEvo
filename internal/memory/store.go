@@ -573,6 +573,30 @@ func (s *Store) GetMeta(key string) string {
 	return v
 }
 
+// DeleteMeta removes a metadata key-value pair.
+func (s *Store) DeleteMeta(key string) error {
+	_, err := s.db.Exec(`DELETE FROM meta WHERE key = ?`, key)
+	return err
+}
+
+// ListMeta returns all metadata keys.
+func (s *Store) ListMeta() []string {
+	rows, err := s.db.Query(`SELECT key FROM meta`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // EmbeddingModelDir returns the bound embedding model directory ("" if unset).
 func (s *Store) EmbeddingModelDir() string { return s.GetMeta("embeddingModelDir") }
 
@@ -873,7 +897,7 @@ func (s *Store) AddUserFact(id, key, value, category, importance, source, worksp
 }
 
 // ListUserFacts returns core-memory rows (newest first).
-// workspaceID ""   → global facts only (workspace_id = '' OR NULL OR 'default').
+// workspaceID ""   → global facts only (legacy sentinels + real default library).
 // workspaceID "*"  → all facts (no filter, for admin views).
 // workspaceID "xxx"→ domain-scoped facts only.
 func (s *Store) ListUserFacts(workspaceID string) ([]UserFact, error) {
@@ -881,8 +905,9 @@ func (s *Store) ListUserFacts(workspaceID string) ([]UserFact, error) {
 	var err error
 	switch {
 	case workspaceID == "":
-		// Global facts: unassigned or default, shared across all domains.
-		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts WHERE workspace_id = '' OR workspace_id = 'default' OR workspace_id IS NULL ORDER BY created_at DESC`)
+		// Global facts: legacy sentinels + facts stored under the real default
+		// library UUID (inserted by AddUserFact with resolved workspaceID).
+		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts WHERE workspace_id = '' OR workspace_id = 'default' OR workspace_id IS NULL OR workspace_id = ? ORDER BY created_at DESC`, s.realDefaultLibrary())
 	case workspaceID == "*":
 		// Admin view: all facts regardless of domain.
 		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts ORDER BY created_at DESC`)

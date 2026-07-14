@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"everevo/internal/sandbox"
+	"everevo/internal/evolve/sandbox"
 )
 
 // VerificationTask describes a self-evolution verification request.

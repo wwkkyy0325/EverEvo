@@ -35,6 +35,11 @@ const router = createRouter({
       component: () => import('@/components/Knowledge.vue'),
     },
     {
+      path: '/paradigm',
+      name: 'paradigm',
+      component: () => import('@/components/ParadigmLibrary.vue'),
+    },
+    {
       path: '/guides',
       name: 'guides',
       component: () => import('@/components/GuideCenter.vue'),

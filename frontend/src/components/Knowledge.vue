@@ -128,33 +128,8 @@
       </div>
     </div>
 
-    <!-- 核心记忆 (P5) — permanent identity/preferences, never decayed/TTL'd -->
-    <div class="glass-panel mem-panel" v-if="isCoreDomain">
-      <div class="mem-head">
-        <span class="mem-icon">🔑</span>
-        <span class="mem-title">核心记忆</span>
-        <span class="tag tag-accent">{{ coreFacts.length }} 条</span>
-        <span v-if="memoryPolicy" class="kg-stats">策略：{{ memoryPolicy.tier }} · 半衰期 {{ memoryPolicy.halfLifeDays }} 天 · TTL {{ memoryPolicy.ttlDays }} 天</span>
-      </div>
-      <div class="kg-core-add">
-        <input v-model="coreKey" class="kg-search" style="flex:1" placeholder="键（如 偏好/身份）" />
-        <input v-model="coreValue" class="kg-search" style="flex:2" placeholder="值（如 喜欢用 Go 写后端）" @keyup.enter="doAddCore" />
-        <button class="btn btn-xs btn-primary" @click="doAddCore" :disabled="busy || !coreValue.trim()">+ 添加</button>
-      </div>
-      <div v-if="coreFacts.length" class="mem-list">
-        <div v-for="f in coreFacts" :key="f.id" class="mem-item">
-          <span class="mem-kind" :class="{ locked: f.locked }">{{ f.locked ? '🔒' : '🔑' }}</span>
-          <span class="mem-text">{{ f.value }}</span>
-          <span class="kg-detail-actions">
-            <button class="btn btn-xs" @click="doLockCore(f.id, !f.locked)" :title="f.locked ? '解锁' : '锁定（永不清理）'">{{ f.locked ? '🔓' : '🔒' }}</button>
-            <button class="btn btn-xs btn-danger" @click="doDeleteCore(f.id)">✕</button>
-          </span>
-        </div>
-      </div>
-    </div>
-
-    <!-- 对话记忆 (P1.5) -->
-    <div class="glass-panel mem-panel" v-if="isCoreDomain">
+    <!-- 对话记忆 (P1.5) — hidden for core domain -->
+    <div class="glass-panel mem-panel" v-if="!isCoreDomain">
       <div class="mem-head">
         <span class="mem-icon">💬</span>
         <span class="mem-title">对话记忆</span>
@@ -305,8 +280,8 @@
       </div>
     </div>
 
-    <!-- P8: Experience items (reflection loop distillations) -->
-    <div class="glass-panel mem-panel" v-if="experienceItems.length">
+    <!-- P8: Experience items (reflection loop distillations) — hidden for core domain -->
+    <div class="glass-panel mem-panel" v-if="experienceItems.length && !isCoreDomain">
       <div class="mem-head">
         <span class="mem-icon">💡</span>
         <span class="mem-title">经验教训</span>
@@ -423,7 +398,7 @@ import { memoryApi } from '../api/memory'
 import { agentsApi } from '../api/agents'
 import type { LocalAgent } from '../api/agents'
 import { wikiApi } from '../api/wiki'
-import type { MemoryStatus, MemoryItem, KgNode, KgEdge, GraphStats, UserFact, MemoryPolicy } from '../api/memory'
+import type { MemoryStatus, MemoryItem, KgNode, KgEdge, GraphStats } from '../api/memory'
 import { lastGraphTrace } from '../stores/chatStore'
 import { Network } from 'vis-network'
 import { DataSet } from 'vis-data'
@@ -607,11 +582,6 @@ const kgSelectedEdge = ref<KgEdge | null>(null)
 const kgStats = ref<GraphStats | null>(null)
 const kgRenameDraft = ref('')
 const kgEdgeRenameDraft = ref('')
-// P5 core memory (permanent) + policy
-const coreFacts = ref<UserFact[]>([])
-const memoryPolicy = ref<MemoryPolicy | null>(null)
-const coreKey = ref('')
-const coreValue = ref('')
 // P6.1 project docs (llmwiki index) — browser + search
 const wikiStatus = ref<{ pages: number; chunks: number } | null>(null)
 const wikiQuery = ref('')
@@ -963,8 +933,6 @@ async function refreshMemory() {
     kgNodes.value = g?.nodes || []
     kgEdges.value = g?.edges || []
     try { kgStats.value = await memoryApi.graphStats() } catch (_) { kgStats.value = null }
-    try { coreFacts.value = (await memoryApi.coreList()) || [] } catch (_) { coreFacts.value = [] }
-    try { memoryPolicy.value = await memoryApi.policy() } catch (_) { memoryPolicy.value = null }
     try { wikiStatus.value = await wikiApi.status(activeLibId.value) } catch (_) { wikiStatus.value = null }
   } catch (_) { /* best-effort */ }
 }
@@ -1056,28 +1024,6 @@ async function doRename() {
   catch (e: unknown) { toast.show('error', '重命名失败', errMsg(e)) }
 }
 
-// ── Core memory (P5) — permanent identity/preferences ──
-async function doAddCore() {
-  if (!coreValue.value.trim() || busy.value) return
-  busy.value = true
-  try {
-    await memoryApi.coreAdd(coreKey.value.trim() || '偏好', coreValue.value.trim(), 'manual')
-    coreKey.value = ''; coreValue.value = ''
-    toast.show('success', '已添加到核心记忆', '')
-    await refreshMemory()
-  } catch (e: unknown) { toast.show('error', '添加失败', errMsg(e)) }
-  busy.value = false
-}
-async function doLockCore(id: string, locked: boolean) {
-  try { await memoryApi.coreLock(id, locked); await refreshMemory() }
-  catch (e: unknown) { toast.show('error', '操作失败', errMsg(e)) }
-}
-async function doDeleteCore(id: string) {
-  if (!await toast.confirm('删除核心记忆', '确定删除此条核心记忆？')) return
-  try { await memoryApi.coreDelete(id); await refreshMemory() }
-  catch (e: unknown) { toast.show('error', '删除失败', errMsg(e)) }
-}
-
 // ── Project docs (P6.1) — llmwiki index ──
 async function doReindexWiki() {
   busy.value = true
@@ -1135,7 +1081,7 @@ onBeforeUnmount(() => { destroyGraph() })
 // Unified refresh — all data mutations trigger a full refresh of the current domain.
 function refreshAll() {
   refreshKBs()
-  refreshMemory()      // memItems, kgNodes, kgEdges, coreFacts, wikiStatus
+  refreshMemory()      // memItems, kgNodes, kgEdges, wikiStatus
   loadEntityLinks()
   loadExperience()
   loadWikiPages()
