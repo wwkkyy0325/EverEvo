@@ -163,6 +163,11 @@
 
           <div class="chat-asst-text" v-html="chat.chatRender(m.content)"></div>
 
+          <!-- Paradigm footnote — subtle marker at bottom-right -->
+          <div v-if="paradigmForMsg(i)" class="paradigm-footnote">
+            【{{ paradigmForMsg(i)!.name }}】
+          </div>
+
           <!-- Tool calls — terminal-style blocks with live execution state -->
           <div v-for="(tc, j) in m.toolCalls" :key="tc.name"
                class="chat-meta-block chat-meta-tool"
@@ -286,6 +291,7 @@ import { useChatStore, type PendingFile } from '../stores/chatStore'
 import { useDataChanged } from '../composables/useDataChanged'
 import { knowledgeApi } from '../api/knowledge'
 import { memoryApi } from '../api/memory'
+import { parseParadigmMarker } from '../utils/paradigm'
 import { fmtSize } from '../utils/formatters'
 import ModeSwitcher from "./ModeSwitcher.vue"
 import AsyncPanel from './AsyncPanel.vue'
@@ -295,6 +301,14 @@ import { useToast } from '../composables/useToast'
 defineProps<{ compact?: boolean }>()
 
 const chat = useChatStore()
+
+// Extract paradigm name from @paradigm{...} marker in assistant message
+function paradigmForMsg(idx: number): { name: string } | null {
+  const m = chat.messages[idx]
+  if (!m || m.role !== 'assistant') return null
+  const info = parseParadigmMarker(m.content)
+  return info ? { name: info.name } : null
+}
 const toast = useToast()
 const asyncStore = useAsyncStore()
 const showAsyncPanel = ref(false)
@@ -1173,6 +1187,17 @@ function scrollChat() {
 .chat-compact .chat-asst-text { font-size: 12px; }
 .chat-compact .chat-panel-box { padding: 10px 10px 14px; gap: 8px; }
 .chat-compact .chat-panel-textarea { font-size: 12px; padding: 8px 10px; }
+
+/* Paradigm footnote — subtle bottom-right marker */
+.paradigm-footnote {
+  text-align: right;
+  font-style: italic;
+  font-size: 0.75em;
+  color: #666;
+  margin-top: 6px;
+  opacity: 0.6;
+  user-select: none;
+}
 
 /* Markdown — assistant text */
 .chat-asst-text :deep(h1) { font-size: 16px; font-weight: 600; margin: 14px 0 6px; }

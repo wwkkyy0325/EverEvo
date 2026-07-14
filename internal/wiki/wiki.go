@@ -31,6 +31,7 @@ const collection = "wiki_docs"
 
 // Chunk is a heading-bounded section of a wiki page.
 type Chunk struct {
+	ID      string `json:"id"`
 	Page    string `json:"page"`
 	Heading string `json:"heading"`
 	Content string `json:"content"`
@@ -197,6 +198,10 @@ CREATE TABLE IF NOT EXISTS wiki_links(src_page TEXT, dst_page TEXT, PRIMARY KEY(
 	if err != nil {
 		return err
 	}
+	// Bidirectional index: doc_type for document-type-aware retrieval.
+	if err := s.addColumnIfMissing("wiki_pages", "doc_type", "TEXT NOT NULL DEFAULT 'general'"); err != nil {
+		return err
+	}
 	// User wiki: add source + content columns for user-created pages.
 	for _, c := range []struct{ col, def string }{
 		{"source", "TEXT NOT NULL DEFAULT 'llmwiki'"},
@@ -207,6 +212,18 @@ CREATE TABLE IF NOT EXISTS wiki_links(src_page TEXT, dst_page TEXT, PRIMARY KEY(
 		if n == 0 {
 			_, _ = s.sql.Exec("ALTER TABLE wiki_pages ADD COLUMN " + c.col + " " + c.def)
 		}
+	}
+	return nil
+}
+
+func (s *Store) addColumnIfMissing(table, col, def string) error {
+	var n int
+	if err := s.sql.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?", table, col).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		_, err := s.sql.Exec("ALTER TABLE " + table + " ADD COLUMN " + col + " " + def)
+		return err
 	}
 	return nil
 }
@@ -316,7 +333,7 @@ func (s *Store) Search(emb []float32, k int) ([]Chunk, error) {
 	}
 	out := make([]Chunk, len(res))
 	for i, r := range res {
-		out[i] = Chunk{Page: r.Metadata["page"], Heading: r.Metadata["heading"], Content: r.Content}
+		out[i] = Chunk{ID: r.ID, Page: r.Metadata["page"], Heading: r.Metadata["heading"], Content: r.Content}
 	}
 	return out, nil
 }
@@ -377,6 +394,22 @@ func (s *Store) SavePageRaw(pageID, title, content string) error {
 		ON CONFLICT(id) DO UPDATE SET title=excluded.title, modified=excluded.modified, content=excluded.content`,
 		pageID, title, now, content)
 	return err
+}
+
+// SetPageDocType updates the document type for a wiki page.
+func (s *Store) SetPageDocType(pageID, docType string) error {
+	_, err := s.sql.Exec(`UPDATE wiki_pages SET doc_type = ? WHERE id = ?`, docType, pageID)
+	return err
+}
+
+// GetPageDocType returns the document type for a wiki page.
+func (s *Store) GetPageDocType(pageID string) string {
+	var dt string
+	_ = s.sql.QueryRow(`SELECT doc_type FROM wiki_pages WHERE id = ?`, pageID).Scan(&dt)
+	if dt == "" {
+		dt = "general"
+	}
+	return dt
 }
 
 // GetPageContent returns the raw markdown content of a page.

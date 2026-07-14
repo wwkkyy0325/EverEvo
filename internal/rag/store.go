@@ -33,11 +33,12 @@ type DocEntry struct {
 // Collection.metadata and document map are unexported. The bm25 field holds
 // per-collection BM25 sparse indices for hybrid vector+keyword retrieval.
 type Store struct {
-	db   *chromem.DB
-	meta map[string]*KnowledgeBase // kbID → metadata
-	docs map[string][]DocEntry     // collectionName → document manifest
-	bm25 map[string]*Bm25Index     // collectionName → BM25 sparse index
-	mu   sync.RWMutex
+	db        *chromem.DB
+	meta      map[string]*KnowledgeBase // kbID → metadata
+	docs      map[string][]DocEntry     // collectionName → document manifest
+	bm25      map[string]*Bm25Index     // collectionName → BM25 sparse index
+	registrar ChunkRegistrar            // optional: called after AddDocuments for bidirectional indexing
+	mu        sync.RWMutex
 }
 
 // NewStore opens or creates the persistent chromem-go DB and loads metadata.
@@ -65,6 +66,14 @@ func NewStore() (*Store, error) {
 	s.loadDocs()
 	s.rebuildBm25()
 	return s, nil
+}
+
+// SetChunkRegistrar sets an optional callback invoked after documents are added
+// to register chunk→source mappings for bidirectional indexing.
+func (s *Store) SetChunkRegistrar(r ChunkRegistrar) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.registrar = r
 }
 
 // ─── JSON 持久化 ────────────────────────────────────────────────
@@ -215,7 +224,20 @@ func (s *Store) AddDocuments(collectionName string, docs []chromem.Document, con
 		bm.Add(d.ID, d.Content)
 	}
 	s.saveDocsLocked()
+	// snapshot registrar before releasing lock
+	reg := s.registrar
 	s.mu.Unlock()
+	// Call registrar outside lock to avoid deadlock with memory store
+	if reg != nil {
+		docIDs := make([]string, len(docs))
+		contents := make([]string, len(docs))
+		for i, d := range docs {
+			docIDs[i] = d.ID
+			contents[i] = d.Content
+		}
+		// Best-effort registration (non-blocking)
+		_ = reg("rag_kb", collectionName, docIDs, 0, contents)
+	}
 	return len(docs), nil
 }
 

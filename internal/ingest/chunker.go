@@ -8,6 +8,29 @@ import (
 
 // SmartChunk picks a chunk strategy based on file extension.
 func SmartChunk(text string, ext string) []string {
+	profile := QuickClassify(text, ext)
+	return smartChunkWithProfile(text, ext, profile)
+}
+
+// SmartChunkWithProfile picks a chunk strategy based on an explicit document profile.
+func SmartChunkWithProfile(text string, ext string, profile DocumentProfile) []string {
+	return smartChunkWithProfile(text, ext, profile)
+}
+
+func smartChunkWithProfile(text string, ext string, profile DocumentProfile) []string {
+	switch profile.Structure {
+	case "highly_structured":
+		// For structured documents, prefer structure-preserving chunking.
+		// If no LLM parsed structure is available, fall through to code/markdown strategies.
+		// The caller should have already run LLM parsing before chunking.
+		return rag.ChunkText(text) // fallback: caller overrides with StructurePreservingChunk after LLM parse
+	case "unstructured":
+		// For narrative/unstructured documents, use semantic chunking (future).
+		// Currently falls through to default.
+		return rag.ChunkText(text)
+	default:
+		// semi_structured: dispatch by file type
+	}
 	switch ext {
 	case ".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".java", ".c", ".cpp", ".h":
 		return chunkCode(text)

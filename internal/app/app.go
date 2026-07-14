@@ -332,6 +332,18 @@ func (a *App) Startup(ctx context.Context) {
 		}
 	}
 
+		// Wire paradigm embedder for semantic matching in Recommend().
+		if a.paradigmManager != nil {
+			if dir := a.memoryStore.EmbeddingModelDir(); dir != "" {
+				a.paradigmManager.SetEmbedder(func(text string) ([]float32, error) {
+					return rag.EmbedQuery(dir, text)
+				})
+				if err := a.paradigmManager.BuildEmbeddings(); err != nil {
+					log.Printf("[paradigm] 嵌入构建失败: %v", err)
+				}
+			}
+		}
+
 		// Register memory as a core.MemoryPlugin so the Engine can discover it.
 		mp := memory.NewMemoryPlugin(a.memoryStore, func(ctx context.Context, text string) ([]float32, error) {
 			dir := a.memoryStore.EmbeddingModelDir()
@@ -419,6 +431,9 @@ func (a *App) Startup(ctx context.Context) {
 		},
 		CallTool: a.CallTool,
 		Collab:   a.collab,
+		EnrichSystemPrompt: func(base, userQuery string) string {
+			return a.enrichAgentPrompt(base, userQuery)
+		},
 	})
 	log.Println("Agent 执行插件已就绪")
 
@@ -482,6 +497,25 @@ func (a *App) Startup(ctx context.Context) {
 			// Backfill KB library IDs (fixes empty + dangling, e.g. orphan lib_18c0842c0b947f70).
 			if ragStore, err := a.getRagStore(); err == nil {
 				ragStore.BackfillLibraryIDs(libID, validIDs)
+				// Wire bidirectional chunk registry: after RAG docs are added,
+				// register chunk→source mappings for hierarchical retrieval.
+				if a.memoryStore != nil {
+					ragStore.SetChunkRegistrar(func(sourceType, sourceID string, docIDs []string, chunkStartIndex int, contents []string) error {
+						entries := make([]memory.ChunkRegistryEntry, len(docIDs))
+						now := time.Now().UnixMilli()
+						for i, id := range docIDs {
+							entries[i] = memory.ChunkRegistryEntry{
+								ChunkID:    id,
+								SourceType: sourceType,
+								SourceID:   sourceID,
+								ChunkIndex: chunkStartIndex + i,
+								ChunkType:  "leaf",
+								CreatedAt:  now,
+							}
+						}
+						return a.memoryStore.RegisterChunks(entries)
+					})
+				}
 			}
 			// Migrate historical graph nodes from "default" to their proper domains.
 			if migrated, mErr := a.MemoryGraphMigrate(); mErr == nil && migrated > 0 {

@@ -13,8 +13,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"everevo/internal/atomic"
@@ -184,9 +186,14 @@ var builtinParadigms = []Paradigm{
 
 // ─── Manager ───────────────────────────────────────────────────────────
 
+// Embedder is a function that embeds text into a vector. Wired by app layer.
+type Embedder func(text string) ([]float32, error)
+
 type ParadigmManager struct {
-	Paradigms      []Paradigm                `json:"paradigms"`
+	Paradigms       []Paradigm                `json:"paradigms"`
 	feedbackHistory map[string][]FeedbackEntry // paradigm ID → ring buffer (last 20)
+	embedder        Embedder                  // optional: enables semantic matching in Recommend
+	embeddings      map[string][]float32       // paradigm ID → pre-computed embedding vector
 }
 
 func paradigmPath() string {
@@ -426,24 +433,80 @@ func (m *ParadigmManager) ListNames() []string {
 	return names
 }
 
-// Recommend returns the top N paradigms ranked by composite strength × category match.
-// Simple heuristic: higher strength → more reliable paradigm. In future, this can
-// be enhanced with embedding similarity between task description and paradigm metadata.
+// SetEmbedder wires an embedding function for semantic paradigm matching.
+// Call BuildEmbeddings after setting to pre-compute paradigm vectors.
+func (m *ParadigmManager) SetEmbedder(e Embedder) {
+	m.embedder = e
+}
+
+// BuildEmbeddings pre-computes embedding vectors for all enabled paradigms.
+// The profile text used for embedding is: name + " " + description + " " + applicable + " " + category.
+// Call this after SetEmbedder to enable semantic matching in Recommend.
+func (m *ParadigmManager) BuildEmbeddings() error {
+	if m.embedder == nil {
+		return fmt.Errorf("paradigm: embedder not set")
+	}
+	m.embeddings = make(map[string][]float32, len(m.Paradigms))
+	for _, p := range m.Paradigms {
+		if !p.Enabled {
+			continue
+		}
+		profile := p.Name + " " + p.Description + " " + p.Applicable + " " + p.Category
+		vec, err := m.embedder(profile)
+		if err != nil {
+			log.Printf("[paradigm] embed %s failed: %v", p.Name, err)
+			continue
+		}
+		m.embeddings[p.ID] = vec
+	}
+	log.Printf("[paradigm] built embeddings for %d/%d paradigms", len(m.embeddings), len(m.Paradigms))
+	return nil
+}
+
+// Recommend returns the top N paradigms ranked by hybrid score:
+//
+//	score = 0.5 × cosine_similarity(task_embedding, paradigm_embedding)
+//	      + 0.3 × keyword_boost(task, paradigm_metadata)
+//	      + 0.2 × historical_strength
+//
+// If no embedder is configured, falls back to keyword + strength scoring.
 func (m *ParadigmManager) Recommend(taskDescription string, topN int) []Paradigm {
-	// For now: return top paradigms sorted by strength (EMA-smoothed success rate).
-	// Future: embed the task, embed paradigm descriptions, use cosine similarity.
 	type scored struct {
 		p     Paradigm
 		score float64
 	}
 	var ranked []scored
+
+	// Try embedding-based scoring first
+	var taskVec []float32
+	if m.embedder != nil {
+		if vec, err := m.embedder(taskDescription); err == nil {
+			taskVec = vec
+		}
+	}
+
 	for _, p := range m.Paradigms {
 		if !p.Enabled {
 			continue
 		}
-		ranked = append(ranked, scored{p: p, score: p.Strength})
+		score := p.Strength * 0.3 // base: historical success weight
+
+		// Semantic similarity (0.5 weight) if embeddings available
+		if taskVec != nil && m.embeddings != nil {
+			if pVec, ok := m.embeddings[p.ID]; ok {
+				sim := cosineSimilarity(taskVec, pVec) // 0.0-1.0
+				score += sim * 0.5
+			}
+		}
+
+		// Keyword boost (0.2 weight) — always available
+		kwScore := keywordMatchScore(taskDescription, p)
+		score += kwScore * 0.2
+
+		ranked = append(ranked, scored{p: p, score: score})
 	}
-	// Sort descending by score.
+
+	// Sort descending by score
 	for i := 0; i < len(ranked); i++ {
 		for j := i + 1; j < len(ranked); j++ {
 			if ranked[j].score > ranked[i].score {
@@ -459,6 +522,76 @@ func (m *ParadigmManager) Recommend(taskDescription string, topN int) []Paradigm
 		out[i] = r.p
 	}
 	return out
+}
+
+// ─── Scoring helpers ─────────────────────────────────────────────────
+
+// cosineSimilarity computes the cosine similarity between two float32 vectors.
+func cosineSimilarity(a, b []float32) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
+	var dot, normA, normB float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		normA += float64(a[i]) * float64(a[i])
+		normB += float64(b[i]) * float64(b[i])
+	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
+}
+
+// keywordMatchScore returns 0.0-1.0 based on keyword overlap between the task
+// description and the paradigm's metadata fields.
+func keywordMatchScore(task string, p Paradigm) float64 {
+	taskLower := strings.ToLower(task)
+	var hits int
+
+	// Paradigm name as a whole token
+	if strings.Contains(taskLower, strings.ToLower(p.Name)) {
+		hits += 3
+	}
+	// Category match (debug queries → debug paradigms, etc.)
+	if strings.Contains(taskLower, p.Category) {
+		hits += 2
+	}
+	// Keywords from description, applicable, methodology
+	keywords := extractKeywords(p)
+	for _, kw := range keywords {
+		if strings.Contains(taskLower, strings.ToLower(kw)) {
+			hits++
+		}
+	}
+	if hits == 0 {
+		return 0
+	}
+	return math.Min(float64(hits)*0.12, 1.0)
+}
+
+// extractKeywords pulls domain-significant words from paradigm metadata.
+func extractKeywords(p Paradigm) []string {
+	text := p.Description + " " + p.Applicable + " " + p.Example
+	words := strings.Fields(text)
+	var out []string
+	for _, w := range words {
+		w = strings.Trim(w, "，,。.、；;：:（）()")
+		if len([]rune(w)) >= 2 {
+			out = append(out, w)
+		}
+	}
+	// Deduplicate
+	seen := make(map[string]bool, len(out))
+	var result []string
+	for _, w := range out {
+		lower := strings.ToLower(w)
+		if !seen[lower] {
+			seen[lower] = true
+			result = append(result, w)
+		}
+	}
+	return result
 }
 
 func (m *ParadigmManager) EnsureLibraryIDs(defaultID string, validIDs []string) error {

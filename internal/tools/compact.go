@@ -167,7 +167,8 @@ func ConsumedMarker(name string, resultBytes int) string {
 // IsCoreTool reports whether a tool name belongs to the always-loaded core set.
 func IsCoreTool(name string) bool {
 	switch name {
-	case "tool_search", "read_file", "shell_exec", "web_search", "web_fetch", "agent_run":
+	case "tool_search", "read_file", "shell_exec", "web_search", "web_fetch", "agent_run",
+		"paradigm_match", "paradigm_select", "paradigm_list", "paradigm_feedback":
 		return true
 	default:
 		return false
@@ -176,5 +177,8 @@ func IsCoreTool(name string) bool {
 
 // CoreToolNames returns the list of always-loaded core tool names.
 func CoreToolNames() []string {
-	return []string{"tool_search", "read_file", "shell_exec", "web_search", "web_fetch", "agent_run"}
+	return []string{
+		"tool_search", "read_file", "shell_exec", "web_search", "web_fetch", "agent_run",
+		"paradigm_match", "paradigm_select", "paradigm_list", "paradigm_feedback",
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"everevo/internal/memory"
 	"everevo/internal/rag"
@@ -679,7 +680,8 @@ func (a *App) MemoryEdgeAddByNames(srcName, dstName, relType, workspaceID string
 }
 
 // MemoryRecallGraphContext does a lightweight keyword search of graph nodes
-// matching the query, returning formatted "entity → relation → entity" lines.
+// matching the query, returning formatted "entity → relation → entity" lines,
+// entity property snapshots, and relevant events.
 // Unlike the full graph retrieval in MemoryRecall, this needs no embedding model.
 func (a *App) MemoryRecallGraphContext(query, libraryID string) string {
 	if a.memoryStore == nil || query == "" {
@@ -691,16 +693,73 @@ func (a *App) MemoryRecallGraphContext(query, libraryID string) string {
 	}
 	var sb strings.Builder
 	seen := map[string]bool{}
+
 	for _, n := range nodes {
+		// Graph edges (entity → relation → entity)
 		edges, _ := a.memoryStore.ListEdgesForNode(n.ID, 5)
 		for _, e := range edges {
 			key := e.SrcName + e.Type + e.DstName
-			if seen[key] { continue }
+			if seen[key] {
+				continue
+			}
 			seen[key] = true
-			sb.WriteString(e.SrcName + " → " + e.Type + " → " + e.DstName + "\n")
+			sb.WriteString(e.SrcName + " → " + e.Type + " → " + e.DstName)
+			if e.Weight > 1 {
+				sb.WriteString(fmt.Sprintf(" (×%d)", e.Weight))
+			}
+			sb.WriteString("\n")
+		}
+
+		// Entity properties (temporal layer)
+		props, _ := a.memoryStore.GetEntityProperties(n.ID)
+		for _, p := range props {
+			key := n.Name + "::" + p.Property
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			timeInfo := ""
+			if p.ValidFrom > 0 || p.ValidTo > 0 {
+				timeInfo = formatTimeRange(p.ValidFrom, p.ValidTo)
+			}
+			sb.WriteString(n.Name + " — " + p.Property + " = " + p.Value + timeInfo + "\n")
+		}
+
+		// Related events
+		events, _ := a.memoryStore.GetEventsForEntity(n.ID, 3)
+		for _, ev := range events {
+			key := "event:" + ev.ID
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			sb.WriteString("[事件] " + ev.Title)
+			if ev.TimeExpression != "" {
+				sb.WriteString(" (" + ev.TimeExpression + ")")
+			}
+			sb.WriteString("\n")
 		}
 	}
 	return strings.TrimSpace(sb.String())
+}
+
+func formatTimeRange(from, to int64) string {
+	f := ""
+	t := ""
+	if from > 0 {
+		f = time.UnixMilli(from).Format("2006-01")
+	}
+	if to > 0 {
+		t = time.UnixMilli(to).Format("2006-01")
+	}
+	if f != "" && t != "" {
+		return " (" + f + " ~ " + t + ")"
+	} else if f != "" {
+		return " (自 " + f + ")"
+	} else if t != "" {
+		return " (至 " + t + ")"
+	}
+	return ""
 }
 
 // MemoryGraphStats returns edge-counts-per-type + top hub nodes.

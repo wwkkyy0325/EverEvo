@@ -251,6 +251,95 @@ CREATE TABLE IF NOT EXISTS activity_log (
 CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity_log(ts);
 CREATE INDEX IF NOT EXISTS idx_activity_kind ON activity_log(kind);
 CREATE INDEX IF NOT EXISTS idx_activity_session ON activity_log(session_id);
+	-- Bidirectional chunk registry: links chromem vector documents back to their
+	-- source documents, enabling parent/child hierarchy and sibling traversal for
+	-- hierarchical retrieval (NuVector / LlamaIndex AutoMergingRetriever pattern).
+	CREATE TABLE IF NOT EXISTS chunk_registry (
+		chunk_id     TEXT PRIMARY KEY,          -- chromem document ID (e.g. "pageA_3")
+		source_type  TEXT NOT NULL,             -- "wiki" | "rag_kb" | "ingest"
+		source_id    TEXT NOT NULL,             -- wiki page ID or KB ID
+		chunk_index  INTEGER NOT NULL,          -- ordinal within source
+		parent_id    TEXT,                      -- parent chunk ID (hierarchical)
+		prev_id      TEXT,                      -- previous sibling chunk ID
+		next_id      TEXT,                      -- next sibling chunk ID
+		content_hash TEXT,                      -- SHA256 for dedup
+		byte_start   INTEGER,                   -- byte offset in original document
+		byte_end     INTEGER,
+		chunk_type   TEXT NOT NULL DEFAULT 'leaf', -- "root" | "parent" | "leaf"
+		created_at   INTEGER NOT NULL,
+		UNIQUE(source_type, source_id, chunk_index)
+	);
+	CREATE INDEX IF NOT EXISTS idx_chunk_registry_source ON chunk_registry(source_type, source_id);
+	CREATE INDEX IF NOT EXISTS idx_chunk_registry_parent ON chunk_registry(parent_id);
+	-- Temporal property layer: assertions about entities with time constraints ("entity X had property Y during [A,B]").
+	CREATE TABLE IF NOT EXISTS kg_entity_properties (
+		id              TEXT PRIMARY KEY,
+		entity_id       TEXT NOT NULL,
+		property        TEXT NOT NULL,           -- e.g. "company", "position", "age", "location"
+		value           TEXT NOT NULL,           -- JSON-compatible value
+		value_type      TEXT NOT NULL DEFAULT 'string', -- "string"|"number"|"date_range"|"boolean"
+		valid_from      INTEGER,                 -- Unix ms, NULL = unknown start
+		valid_to        INTEGER,                 -- Unix ms, NULL = currently valid
+		confidence      REAL NOT NULL DEFAULT 1.0,
+		source_type     TEXT,                    -- "llm_extraction"|"user_input"|"inference"
+		source_chunk_id TEXT,                    -- provenance trace
+		evidence        TEXT,                    -- original text evidence snippet
+		recorded_at     INTEGER NOT NULL,
+		FOREIGN KEY (entity_id) REFERENCES kg_nodes(id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_ep_entity ON kg_entity_properties(entity_id);
+	CREATE INDEX IF NOT EXISTS idx_ep_time ON kg_entity_properties(entity_id, valid_from, valid_to);
+	-- Spatial layer: geographic/spatial attributes for entities and events.
+	CREATE TABLE IF NOT EXISTS kg_spatial (
+		id              TEXT PRIMARY KEY,
+		entity_id       TEXT,
+		event_id        TEXT,
+		spatial_type    TEXT NOT NULL,           -- "point"|"address"|"region"|"named_location"
+		coordinates     TEXT,                    -- "POINT(lng lat)" or GeoJSON
+		address         TEXT,
+		region          TEXT,                    -- e.g. "北京市朝阳区"
+		named_location  TEXT,                    -- e.g. "霍格沃茨大厅"
+		valid_from      INTEGER,
+		valid_to        INTEGER,
+		confidence      REAL NOT NULL DEFAULT 1.0,
+		source_chunk_id TEXT,
+		recorded_at     INTEGER NOT NULL,
+		CHECK (entity_id IS NOT NULL OR event_id IS NOT NULL)
+	);
+	CREATE INDEX IF NOT EXISTS idx_spatial_entity ON kg_spatial(entity_id);
+	-- Event table: extracted plot/legal/historical events with temporal ordering.
+	CREATE TABLE IF NOT EXISTS kg_events (
+		id              TEXT PRIMARY KEY,
+		title           TEXT NOT NULL,
+		description     TEXT,
+		event_type      TEXT,                    -- "legal_action"|"plot_event"|"historical_event"
+		time_start      INTEGER,                 -- Unix ms
+		time_end        INTEGER,                 -- Unix ms, NULL = instantaneous
+		time_expression TEXT,                    -- original text: "三天后" / "2020年1月"
+		timeline_order  INTEGER,                 -- logical ordinal within source text
+		duration        TEXT,                    -- ISO 8601 duration: "P3D" / "PT2H"
+		confidence      REAL NOT NULL DEFAULT 1.0,
+		source_chunk_id TEXT,
+		created_at      INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_events_time ON kg_events(time_start, time_end);
+	CREATE INDEX IF NOT EXISTS idx_events_order ON kg_events(timeline_order);
+	-- Concept taxonomy tree: IS_A / PART_OF / broader/narrower hierarchy for domain concepts.
+	CREATE TABLE IF NOT EXISTS kg_concept_tree (
+		id              TEXT PRIMARY KEY,
+		concept         TEXT NOT NULL,
+		parent_id       TEXT,
+		tree_type       TEXT NOT NULL DEFAULT 'IS_A',
+		level           INTEGER NOT NULL DEFAULT 0,
+		definition      TEXT,
+		domain          TEXT,
+		synonyms        TEXT NOT NULL DEFAULT '[]',  -- JSON array (SKOS altLabels)
+		source_chunk_id TEXT,
+		created_at      INTEGER NOT NULL,
+		FOREIGN KEY (parent_id) REFERENCES kg_concept_tree(id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_concept_parent ON kg_concept_tree(parent_id);
+	CREATE INDEX IF NOT EXISTS idx_concept_domain ON kg_concept_tree(domain);
 `
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
@@ -299,6 +388,28 @@ CREATE INDEX IF NOT EXISTS idx_activity_session ON activity_log(session_id);
 		{"concept_tags", "TEXT NOT NULL DEFAULT '[]'"},
 	} {
 		if err := s.addColumnIfMissing("memory_items", c.col, c.def); err != nil {
+			return err
+		}
+	}
+	// Phase 3: KG property system — extend nodes and edges with rich attributes.
+	for _, c := range []struct{ col, def string }{
+		{"aliases", "TEXT NOT NULL DEFAULT ''"},
+		{"description", "TEXT NOT NULL DEFAULT ''"},
+		{"entity_uri", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.addColumnIfMissing("kg_nodes", c.col, c.def); err != nil {
+			return err
+		}
+	}
+	for _, c := range []struct{ col, def string }{
+		{"polarity", "TEXT NOT NULL DEFAULT 'neutral'"},
+		{"intensity", "REAL NOT NULL DEFAULT 0.5"},
+		{"level", "TEXT NOT NULL DEFAULT ''"},
+		{"confidence", "REAL NOT NULL DEFAULT 1.0"},
+		{"source_chunk_id", "TEXT NOT NULL DEFAULT ''"},
+		{"evidence", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.addColumnIfMissing("kg_edges", c.col, c.def); err != nil {
 			return err
 		}
 	}
@@ -2224,4 +2335,181 @@ func (s *Store) MigrateModel(newDir string, embedBatch func([]string) ([][]float
 		}
 	}
 	return s.SetEmbeddingModel(newDir)
+}
+
+// ─── Chunk Registry (bidirectional index: vector ↔ source document) ────────
+
+// ChunkRegistryEntry is a row in the chunk_registry table.
+type ChunkRegistryEntry struct {
+	ChunkID     string `json:"chunkId"`
+	SourceType  string `json:"sourceType"`
+	SourceID    string `json:"sourceId"`
+	ChunkIndex  int    `json:"chunkIndex"`
+	ParentID    string `json:"parentId,omitempty"`
+	PrevID      string `json:"prevId,omitempty"`
+	NextID      string `json:"nextId,omitempty"`
+	ContentHash string `json:"contentHash,omitempty"`
+	ByteStart   int    `json:"byteStart"`
+	ByteEnd     int    `json:"byteEnd"`
+	ChunkType   string `json:"chunkType"`
+	CreatedAt   int64  `json:"createdAt"`
+}
+
+// RegisterChunk inserts or replaces a chunk registry entry.
+func (s *Store) RegisterChunk(e ChunkRegistryEntry) error {
+	if e.ChunkID == "" || e.SourceType == "" || e.SourceID == "" {
+		return fmt.Errorf("chunk_registry: chunk_id, source_type, and source_id are required")
+	}
+	if e.ChunkType == "" {
+		e.ChunkType = "leaf"
+	}
+	if e.CreatedAt == 0 {
+		e.CreatedAt = time.Now().UnixMilli()
+	}
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO chunk_registry
+		(chunk_id, source_type, source_id, chunk_index, parent_id, prev_id, next_id,
+		 content_hash, byte_start, byte_end, chunk_type, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ChunkID, e.SourceType, e.SourceID, e.ChunkIndex,
+		nullIfEmpty(e.ParentID), nullIfEmpty(e.PrevID), nullIfEmpty(e.NextID),
+		nullIfEmpty(e.ContentHash), e.ByteStart, e.ByteEnd, e.ChunkType, e.CreatedAt)
+	return err
+}
+
+// RegisterChunks bulk-inserts chunk registry entries in a transaction.
+func (s *Store) RegisterChunks(entries []ChunkRegistryEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, e := range entries {
+		if e.ChunkType == "" {
+			e.ChunkType = "leaf"
+		}
+		if e.CreatedAt == 0 {
+			e.CreatedAt = time.Now().UnixMilli()
+		}
+		_, err := tx.Exec(`INSERT OR REPLACE INTO chunk_registry
+			(chunk_id, source_type, source_id, chunk_index, parent_id, prev_id, next_id,
+			 content_hash, byte_start, byte_end, chunk_type, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			e.ChunkID, e.SourceType, e.SourceID, e.ChunkIndex,
+			nullIfEmpty(e.ParentID), nullIfEmpty(e.PrevID), nullIfEmpty(e.NextID),
+			nullIfEmpty(e.ContentHash), e.ByteStart, e.ByteEnd, e.ChunkType, e.CreatedAt)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// GetChunk returns a single chunk registry entry by chunk_id.
+func (s *Store) GetChunk(chunkID string) (*ChunkRegistryEntry, error) {
+	var e ChunkRegistryEntry
+	var parentID, prevID, nextID, contentHash sql.NullString
+	var bStart, bEnd int64
+	err := s.db.QueryRow(`SELECT chunk_id, source_type, source_id, chunk_index,
+		parent_id, prev_id, next_id, content_hash, byte_start, byte_end, chunk_type, created_at
+		FROM chunk_registry WHERE chunk_id = ?`, chunkID).Scan(
+		&e.ChunkID, &e.SourceType, &e.SourceID, &e.ChunkIndex,
+		&parentID, &prevID, &nextID, &contentHash,
+		&bStart, &bEnd, &e.ChunkType, &e.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	e.ParentID = parentID.String
+	e.PrevID = prevID.String
+	e.NextID = nextID.String
+	e.ContentHash = contentHash.String
+	e.ByteStart = int(bStart)
+	e.ByteEnd = int(bEnd)
+	return &e, nil
+}
+
+// GetChunksBySource returns all chunk entries for a source, ordered by chunk_index.
+func (s *Store) GetChunksBySource(sourceType, sourceID string) ([]ChunkRegistryEntry, error) {
+	rows, err := s.db.Query(`SELECT chunk_id, source_type, source_id, chunk_index,
+		COALESCE(parent_id,''), COALESCE(prev_id,''), COALESCE(next_id,''),
+		COALESCE(content_hash,''), COALESCE(byte_start,0), COALESCE(byte_end,0), chunk_type, created_at
+		FROM chunk_registry WHERE source_type = ? AND source_id = ?
+		ORDER BY chunk_index`, sourceType, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChunkRegistryEntry
+	for rows.Next() {
+		var e ChunkRegistryEntry
+		if err := rows.Scan(&e.ChunkID, &e.SourceType, &e.SourceID, &e.ChunkIndex,
+			&e.ParentID, &e.PrevID, &e.NextID, &e.ContentHash,
+			&e.ByteStart, &e.ByteEnd, &e.ChunkType, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// GetChunkSiblings returns the parent, prev, and next siblings for a chunk,
+// enabling the hierarchical retrieval expansion pattern.
+func (s *Store) GetChunkSiblings(chunkID string) (parent *ChunkRegistryEntry, prev *ChunkRegistryEntry, next *ChunkRegistryEntry, _ error) {
+	entry, err := s.GetChunk(chunkID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if entry.ParentID != "" {
+		parent, _ = s.GetChunk(entry.ParentID)
+	}
+	if entry.PrevID != "" {
+		prev, _ = s.GetChunk(entry.PrevID)
+	}
+	if entry.NextID != "" {
+		next, _ = s.GetChunk(entry.NextID)
+	}
+	return parent, prev, next, nil
+}
+
+// ParentForLeafs checks whether top-K leaf results share the same parent.
+// If ≥threshold fraction of chunkIDs share a common parent, returns that parent
+// (AutoMergingRetriever pattern). Otherwise returns nil.
+func (s *Store) ParentForLeafs(chunkIDs []string, threshold float64) *ChunkRegistryEntry {
+	if len(chunkIDs) == 0 || threshold <= 0 || threshold > 1 {
+		return nil
+	}
+	parentCount := make(map[string]int)
+	for _, id := range chunkIDs {
+		e, err := s.GetChunk(id)
+		if err != nil || e.ParentID == "" {
+			continue
+		}
+		parentCount[e.ParentID]++
+	}
+	for parentID, count := range parentCount {
+		if float64(count)/float64(len(chunkIDs)) >= threshold {
+			p, _ := s.GetChunk(parentID)
+			return p
+		}
+	}
+	return nil
+}
+
+// DeleteChunksBySource removes all chunk registry entries for a source.
+func (s *Store) DeleteChunksBySource(sourceType, sourceID string) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM chunk_registry WHERE source_type = ? AND source_id = ?`,
+		sourceType, sourceID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }

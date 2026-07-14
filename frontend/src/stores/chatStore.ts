@@ -1475,11 +1475,8 @@ export const useChatStore = defineStore('chat', () => {
         systemContent = ctx.systemPrompt
         tools = (ctx.tools || []) as ToolDef[]
         const ag = agents.value.find(a => a.id === selId)
-        // Prepend ReAct framework if the agent prompt doesn't already include it.
-        if (!systemContent.includes('ReAct') && !systemContent.includes('推理-行动')) {
-          systemContent = '你是 EverEvo 的 AI 助手，遵循 ReAct（推理-行动）框架工作。\n\n## 工作流程\n1. 分析需求 → 2. 调用工具 → 3. 观察结果 → 4. 重复直至完成 → 5. 最终回答（简洁中文，不照搬 JSON）\n\n## 工具规则\n- 先思考再行动，失败换方案\n- JSON 提取关键字段，不要整套贴出\n- 不需要工具就直接回答\n\n---\n\n' + systemContent
-        }
-        // Think mode instruction is injected in the shared block below.
+        // System prompt is fully assembled by backend buildOrchestratorPrompt
+        // (ReAct framework + skills + thinkLang hint + paradigm hint — all inline)
         agentStream = {
           providerId: ctx.providerId || '',
           model: ctx.model || '',
@@ -1563,16 +1560,30 @@ export const useChatStore = defineStore('chat', () => {
       }
     }
 
-    // Think mode: inject English reasoning instruction with effort level.
-    if (thinkMode.value) {
-      const effortHint = thinkEffort.value === 'max' ? 'Think deeply and exhaustively before answering.' : 'Think briefly before answering.'
-      systemContent += '\n\nYou MUST think before answering. Use internal reasoning in English to plan your approach, then respond to the user in Chinese. ' + effortHint
-    }
-
-    // P1.5: inject long-term semantic memory (cross-session recall). Two-pass:
-    // relevant past Q&A turns + extracted facts. Empty when no embedding model
-    // is bound — zero impact on the chat.
+    // Per-turn thinking language control: backend classifies the query for
+    // Language-Mixed CoT (Li et al. EMNLP 2025, KO-REAson 2025).
+    // English = logic/reasoning/math/code. Chinese = entities/user content.
+    // MUST run before userQuery is consumed by memory/recall below.
     const userQuery = sanitizeForRecall(lastUserContent())
+    try {
+      const tlResult = await go.ClassifyThinkLang(userQuery)
+      if (tlResult?.rule) systemContent += '\n\n' + tlResult.rule
+    } catch (e) { console.warn('[chat] thinkLang classification failed:', errMsg(e)) }
+
+    // ── Paradigm list: full catalog (19 items, ~350 tokens) — LLM picks directly ──
+    try {
+      const allParadigms = await memoryApi.paradigmList() || []
+      const enabled = allParadigms.filter((p: any) => p.enabled !== false)
+      if (enabled.length) {
+        const lines = enabled.map((p: any) =>
+          `- \`${p.id}\` ${p.icon || '🧠'} **${p.name}** [${p.category}] ${p.description || ''}`
+        )
+        systemContent += '\n\n---\n## 🧠 思维范式（选择后调用 `paradigm_select` 加载方法论）\n\n' + lines.join('\n')
+        systemContent += '\n\n完成后调用 `paradigm_feedback(id, match, exec, outcome, "原因")` 提交反馈。'
+      }
+    } catch (_) { /* best-effort */ }
+
+    // P1.5: inject long-term semantic memory (cross-session recall).
     if (userQuery) {
       // ── Layered memory budget (per-source, % of effective context window) ──
       // Codex: 70% of effective window for memory rollouts. We allocate ~40%
@@ -1685,15 +1696,8 @@ export const useChatStore = defineStore('chat', () => {
 	      } catch (_) {}
 	    }
 
-    // ── Transparent token budget (Codex-style) ──
-    // Tell the model exactly how much context remains. Codex injects:
-    //   "You have {N} tokens left in this context window."
-    // We always include it — the model self-manages better with visibility.
-    {
-      const remaining = contextTarget.value - contextTokens.value
-      const pct = Math.round(contextTokens.value / Math.max(1, contextTarget.value) * 100)
-      systemContent += `\n\n[Token Budget] Context window: ${fmtTokens(contextLimit.value)} total, ${fmtTokens(contextTarget.value)} usable. Currently using ${fmtTokens(contextTokens.value)} (${pct}%). ${fmtTokens(remaining)} tokens remaining.`
-    }
+    // ── Tool discovery hint (replaces Token Budget noise) ──
+    systemContent += '\n\n💡 调用 `tool_search` 发现更多工具 | 思维范式: `paradigm_match` 匹配 → `paradigm_select` 加载方法论 → `paradigm_feedback` 反馈'
 
     const apiMsgs: APIMessage[] = normalizeToolMessages([
       { role: 'system', content: systemContent },

@@ -32,6 +32,11 @@ type Deps struct {
 	ChatCompletion func(p *config.LLMProvider, messagesJSON, toolsJSON json.RawMessage, opts ChatOpts) (map[string]any, error)
 	CallTool       func(name string, params map[string]any) tools.ToolResult
 	Collab         *collab.Kernel
+	// EnrichSystemPrompt is called by buildAgentSystemPrompt to inject
+	// per-turn context: thinking language control, paradigm recommendations, etc.
+	// base is the agent's persona prompt; userQuery is the current user message.
+	// Returns the enriched system prompt.
+	EnrichSystemPrompt func(base string, userQuery string) string
 }
 
 // ChatOpts mirrors the app.chatOpts struct so the plugin doesn't import app.
@@ -159,26 +164,67 @@ func agentSelectedSkills(agent *agents.Agent) []skills.Skill {
 	return out
 }
 
-// buildAgentSystemPrompt composes the agent persona prompt with the usage hints
-// of its selected skills.
-func buildAgentSystemPrompt(agent *agents.Agent) string {
+// buildOrchestratorPrompt is the single system prompt assembly point for all
+// agent interactions — main chat, sub-agent delegation, and collab sessions.
+//
+// Assembly order (matches Anthropic / OpenClaw best practices):
+//  1. Agent persona (SystemPrompt or BaseSystemPrompt)
+//  2. Skill context (compact: titles only, full prompts loaded on-demand)
+//  3. ThinkLang rule (per-turn, query-driven)
+//  4. Paradigm hint (lightweight: suggests paradigm_match tool, not full table)
+//  5. Per-turn enrichments from Deps (memory/wiki/rag — provided by caller)
+func buildOrchestratorPrompt(agent *agents.Agent, userQuery string) string {
+	// 1. Agent persona
 	base := agent.SystemPrompt
 	if strings.TrimSpace(base) == "" {
 		base = agents.BaseSystemPrompt
 	}
+	// Ensure ReAct framework is present
 	if !strings.Contains(base, "ReAct") && !strings.Contains(base, "推理-行动") {
 		base = "你是 EverEvo 的 AI 助手，遵循 ReAct（推理-行动）框架工作。\n\n## 工作流程\n1. 分析需求 → 2. 调用工具 → 3. 观察结果 → 4. 重复直至完成 → 5. 最终回答（简洁中文，不照搬 JSON）\n\n## 工具规则\n- 先思考再行动，失败换方案\n- JSON 提取关键字段，不要整套贴出\n- 不需要工具就直接回答\n\n---\n\n" + base
 	}
-	var parts []string
+
+	// 2. Skill context — compact: titles only
+	var skillTitles []string
 	for _, s := range agentSelectedSkills(agent) {
-		if strings.TrimSpace(s.SystemPrompt) != "" {
-			parts = append(parts, fmt.Sprintf("【%s】%s", s.Title, s.SystemPrompt))
+		skillTitles = append(skillTitles, fmt.Sprintf("%s %s", s.Icon, s.Title))
+	}
+	if len(skillTitles) > 0 {
+		base += "\n\n已启用的能力角色：" + strings.Join(skillTitles, "、")
+	}
+
+	// 3. ThinkLang rule (per-turn)
+	if userQuery != "" && d != nil {
+		tl := classifyThinkLang(userQuery)
+		if tl != "" {
+			base += "\n\n---\n" + tl
 		}
 	}
-	if len(parts) == 0 {
-		return base
+
+	// 4. Paradigm list — injected by frontend (full catalog, not just hint)
+
+	// 5. Per-turn enrichments from Deps (memory/wiki/rag context provided by caller)
+	if d != nil && d.EnrichSystemPrompt != nil {
+		base = d.EnrichSystemPrompt(base, userQuery)
 	}
-	return base + "\n\n当前启用的能力角色：\n" + strings.Join(parts, "\n")
+
+	return base
+}
+
+// buildAgentSystemPrompt is the legacy entry point kept for backward compatibility
+// with GetAgentChatContext (which doesn't have userQuery). New code should use
+// buildOrchestratorPrompt directly.
+func buildAgentSystemPrompt(agent *agents.Agent) string {
+	return buildOrchestratorPrompt(agent, "")
+}
+
+// classifyThinkLang returns the thinking language rule for a user query.
+func classifyThinkLang(userQuery string) string {
+	if userQuery == "" {
+		return ""
+	}
+	tl := memory.ClassifyThinkLang(userQuery)
+	return tl.Rule
 }
 
 // buildAgentToolNames returns the union of the agent's granted tool names:
@@ -225,6 +271,7 @@ func resolveAgentToolDefs(agent *agents.Agent, excludeOrchestration bool) []*too
 	for _, n := range buildAgentToolNames(agent) {
 		allowed[n] = true
 	}
+	// Always include core tools (paradigm, tool_search, agent_run, etc.)
 	hasExplicitMCP := len(agent.MCPTools) > 0 && !agent.InheritSkills
 	mcpWhitelist := map[string]bool{}
 	for _, n := range agent.MCPTools {
@@ -232,8 +279,16 @@ func resolveAgentToolDefs(agent *agents.Agent, excludeOrchestration bool) []*too
 	}
 
 	var out []*tools.ToolDef
+	// Always start with core tools (paradigm, tool_search, etc.)
+	if !excludeOrchestration {
+		out = append(out, tools.CoreToolsDef()...)
+	}
 	for _, t := range tools.List() {
 		if excludeOrchestration && tools.IsOrchestrationTool(t.Name) {
+			continue
+		}
+		// Skip core tools (already added above) and orchestration tools when excluded
+		if tools.IsCoreTool(t.Name) {
 			continue
 		}
 		if allowed[t.Name] {
@@ -301,7 +356,7 @@ func RunAgentLoopCollab(ctx context.Context, agent *agents.Agent, userText, coll
 	if err != nil {
 		return "", err
 	}
-	systemPrompt := buildAgentSystemPrompt(agent)
+	systemPrompt := buildOrchestratorPrompt(agent, userText)
 	toolsJSON := marshalAgentToolDefs(resolveAgentToolDefs(agent, true))
 
 	msgs := []map[string]any{

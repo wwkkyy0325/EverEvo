@@ -74,25 +74,6 @@ async function quickFeedback(success: boolean) {
     await memoryApi.paradigmFeedback(props.paradigm.id, v, v, v, success ? '整体有效' : '整体无效')
   } catch (_) {}
 }
-
-// Parse @paradigm{...} from message text.
-export function parseParadigmMarker(text: string): { paradigm: ParadigmInfo | null; cleanText: string } {
-  const matchRe = text.match(/@paradigm\s*(\{[\s\S]*?\})\s*$/)
-  if (!matchRe) return { paradigm: null, cleanText: text }
-  try {
-    const data = JSON.parse(matchRe[1])
-    if (!data.id || !data.name) return { paradigm: null, cleanText: text }
-    return {
-      paradigm: {
-        id: data.id, name: data.name,
-        match: typeof data.match === 'number' ? data.match : 0.5,
-        exec: typeof data.exec === 'number' ? data.exec : 0.5,
-        outcome: typeof data.outcome === 'number' ? data.outcome : 0.5,
-      },
-      cleanText: text.slice(0, matchRe.index).trimEnd(),
-    }
-  } catch { return { paradigm: null, cleanText: text } }
-}
 </script>
 
 <style scoped>

@@ -176,6 +176,51 @@ func (a *App) ParadigmFeedbackHistory(id string, limit int) ([]memory.FeedbackEn
 	return a.paradigmManager.FeedbackHistory(id, limit), nil
 }
 
+// ParadigmForceMode returns the current paradigm force mode.
+// "" = auto-recommend, "<id>" = specific forced paradigm.
+var paradigmForceMode string
+
+// ParadigmSetForce sets or clears a forced paradigm. Pass "" to clear (auto mode).
+func (a *App) ParadigmSetForce(paradigmID string) error {
+	if paradigmID == "" {
+		paradigmForceMode = ""
+		return nil
+	}
+	if a.paradigmManager == nil {
+		return fmt.Errorf("paradigm manager not ready")
+	}
+	if _, err := a.paradigmManager.Get(paradigmID); err != nil {
+		return err
+	}
+	paradigmForceMode = paradigmID
+	return nil
+}
+
+// ParadigmGetForce returns the currently forced paradigm ID or "".
+func (a *App) ParadigmGetForce() string {
+	return paradigmForceMode
+}
+
+// ParadigmForceInfo returns info about the forced paradigm for UI display.
+func (a *App) ParadigmForceInfo() map[string]any {
+	if paradigmForceMode == "" || a.paradigmManager == nil {
+		return map[string]any{"enabled": false}
+	}
+	p, err := a.paradigmManager.Get(paradigmForceMode)
+	if err != nil {
+		return map[string]any{"enabled": false}
+	}
+	return map[string]any{
+		"enabled":    true,
+		"id":         p.ID,
+		"name":       p.Name,
+		"icon":       p.Icon,
+		"category":   p.Category,
+		"strength":   p.Strength,
+		"methodology": p.Methodology,
+	}
+}
+
 func joinOrNone(ss []string) string {
 	if len(ss) == 0 {
 		return "（无）"

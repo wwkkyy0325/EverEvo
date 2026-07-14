@@ -9,7 +9,9 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"everevo/internal/memory"
 	"everevo/internal/rag"
 	"everevo/internal/wiki"
 )
@@ -87,6 +89,10 @@ func (a *App) WikiReindex(libraryID string) (map[string]any, error) {
 		if e := ws.IndexPage(pageID, pageID, path, 0, chunksList, embs); e == nil {
 			pages++
 			chunks += len(chunksList)
+			// Register chunk→source bidirectional mapping
+			if a.memoryStore != nil {
+				a.registerWikiChunks(ws.LibraryID(), pageID, chunksList)
+			}
 		}
 		allLinks = append(allLinks, links...)
 		return nil
@@ -115,6 +121,8 @@ func (a *App) WikiSearch(libraryID, q string) ([]wiki.Chunk, error) {
 
 // WikiRecall returns a formatted text block of the top wiki hits for the chat
 // system prompt, scoped to a domain library.
+// Uses hierarchical retrieval: if enough leaf chunks share a common parent,
+// the parent is returned instead (AutoMergingRetriever pattern).
 func (a *App) WikiRecall(libraryID, query string) (string, error) {
 	ws := a.getWikiStore(libraryID)
 	if ws == nil || query == "" {
@@ -128,16 +136,70 @@ func (a *App) WikiRecall(libraryID, query string) (string, error) {
 	if err != nil {
 		return "", nil
 	}
-	hits, err := ws.Search(emb, 5)
+	// Retrieve more candidates so AutoMerging has enough signals.
+	hits, err := ws.Search(emb, 8)
 	if err != nil || len(hits) == 0 {
 		return "", nil
 	}
-	var lines []string
-	for _, h := range hits {
-		preview := strings.ReplaceAll(h.Content, "\n", " ")
-		if len(preview) > 300 {
-			preview = preview[:300] + "…"
+
+	// Hierarchical retrieval via chunk_registry (if available).
+	var expanded []wiki.Chunk
+	if a.memoryStore != nil {
+		// Collect chunk IDs for AutoMerging check.
+		chunkIDs := make([]string, 0, len(hits))
+		for _, h := range hits {
+			if h.ID != "" {
+				chunkIDs = append(chunkIDs, h.ID)
+			}
 		}
+		// AutoMergingRetriever: if ≥ 50% of top results share a parent, use parent.
+		if parent := a.memoryStore.ParentForLeafs(chunkIDs, 0.5); parent != nil {
+			// Fetch parent content from the wiki store page content.
+			content, _ := ws.GetPageContent(parent.SourceID)
+			if content != "" {
+				expanded = append(expanded, wiki.Chunk{
+					Page:    parent.SourceID,
+					Heading: "[Section Context]",
+					Content: truncate(content, 600),
+				})
+			}
+		}
+		// Expand siblings for remaining leaf chunks.
+		for _, id := range chunkIDs {
+			_, prev, next, _ := a.memoryStore.GetChunkSiblings(id)
+			if prev != nil {
+				if c, err := ws.GetPageContent(prev.SourceID); err == nil {
+					expanded = append(expanded, wiki.Chunk{
+						Page:    prev.SourceID,
+						Heading: "[Adjacent Section]",
+						Content: truncate(c, 300),
+					})
+				}
+			}
+			if next != nil {
+				if c, err := ws.GetPageContent(next.SourceID); err == nil {
+					expanded = append(expanded, wiki.Chunk{
+						Page:    next.SourceID,
+						Heading: "[Adjacent Section]",
+						Content: truncate(c, 300),
+					})
+				}
+			}
+		}
+	}
+
+	// Format results.
+	var lines []string
+	seen := make(map[string]bool)
+	allHits := append(hits, expanded...)
+	for _, h := range allHits {
+		key := h.Page + h.Heading
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		preview := strings.ReplaceAll(h.Content, "\n", " ")
+		preview = truncate(preview, 300)
 		head := h.Page
 		if h.Heading != "" {
 			head += " › " + h.Heading
@@ -145,6 +207,14 @@ func (a *App) WikiRecall(libraryID, query string) (string, error) {
 		lines = append(lines, fmt.Sprintf("📄 %s\n%s", head, preview))
 	}
 	return strings.Join(lines, "\n\n"), nil
+}
+
+func truncate(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "…"
 }
 // WikiSavePage creates or updates a user wiki page.
 func (a *App) WikiSavePage(libraryID, pageID, title, content string) error {
@@ -159,6 +229,11 @@ func (a *App) WikiSavePage(libraryID, pageID, title, content string) error {
 	embedFn := func(texts []string) ([][]float32, error) { return rag.EmbedChunks(dir, texts) }
 	if err := ws.SavePage(pageID, title, content, embedFn); err != nil {
 		return err
+	}
+	// Register chunks for bidirectional indexing (re-register since old IDs replicate)
+	if a.memoryStore != nil {
+		chunksList, _ := wiki.ParseMarkdown(pageID, content)
+		a.registerWikiChunks(ws.LibraryID(), pageID, chunksList)
 	}
 	a.emitChanged("wiki:changed", "save", pageID)
 	return nil
@@ -249,5 +324,28 @@ func (a *App) WikiReadPage(libraryID, pageID string) (map[string]any, error) {
 		"path":    pagePath,
 		"content": string(data),
 	}, nil
+}
+
+// registerWikiChunks registers wiki chunks into the bidirectional chunk_registry.
+func (a *App) registerWikiChunks(libraryID, pageID string, chunks []wiki.Chunk) {
+	if a.memoryStore == nil || len(chunks) == 0 {
+		return
+	}
+	now := time.Now().UnixMilli()
+	entries := make([]memory.ChunkRegistryEntry, len(chunks))
+	for i := range chunks {
+		chunkID := fmt.Sprintf("%s_%d", pageID, i)
+		entries[i] = memory.ChunkRegistryEntry{
+			ChunkID:    chunkID,
+			SourceType: "wiki",
+			SourceID:   pageID,
+			ChunkIndex: i,
+			ChunkType:  "leaf",
+			CreatedAt:  now,
+		}
+	}
+	if err := a.memoryStore.RegisterChunks(entries); err != nil {
+		log.Printf("[wiki] chunk registry 注册失败 page=%s: %v", pageID, err)
+	}
 }
 

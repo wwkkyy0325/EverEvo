@@ -171,6 +171,10 @@ func (a *App) resolveExtractionProvider() (*config.LLMProvider, error) {
 // CORS / fetch issues in the Wails WebView. Returns the normalized response.
 func (a *App) ChatProxy(messagesJSON json.RawMessage, toolsJSON json.RawMessage) (map[string]any, error) {
 	messagesJSON = a.injectTaskBoard(messagesJSON)
+	messagesJSON = a.injectThinkLang(messagesJSON)
+	if paradigmForceMode != "" {
+		messagesJSON = a.injectParadigmForce(messagesJSON, paradigmForceMode)
+	}
 	p, err := a.resolveActiveProvider()
 	if err != nil {
 		log.Printf("[chat] ChatProxy called activeID=%s providers=%d", a.cfg.LLM.ActiveProvider, len(a.cfg.LLM.Providers))
@@ -422,6 +426,10 @@ func (a *App) ChatStreamCancel(streamID string) {
 // The frontend must register EventsOn listeners BEFORE calling this method.
 func (a *App) ChatStream(streamID string, messagesJSON json.RawMessage, toolsJSON json.RawMessage, thinkEffort string) {
 	messagesJSON = a.injectTaskBoard(messagesJSON)
+	messagesJSON = a.injectThinkLang(messagesJSON)
+	if paradigmForceMode != "" {
+		messagesJSON = a.injectParadigmForce(messagesJSON, paradigmForceMode)
+	}
 	go func() {
 		// Recover from any panic during SSE parsing/provider resolution so the
 		// frontend always gets a terminal event — otherwise a malformed chunk
@@ -472,6 +480,10 @@ func (a *App) ChatStream(streamID string, messagesJSON json.RawMessage, toolsJSO
 // Pass temperature < 0 to omit it (use provider default) and maxTokens <= 0 to omit.
 func (a *App) ChatStreamAs(streamID string, messagesJSON json.RawMessage, toolsJSON json.RawMessage, providerId, model string, temperature float64, maxTokens int, thinkEffort string) {
 	messagesJSON = a.injectTaskBoard(messagesJSON)
+	messagesJSON = a.injectThinkLang(messagesJSON)
+	if paradigmForceMode != "" {
+		messagesJSON = a.injectParadigmForce(messagesJSON, paradigmForceMode)
+	}
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {

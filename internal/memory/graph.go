@@ -12,17 +12,23 @@ import (
 
 // GraphEdge is a relation between two entities, with both endpoints' names.
 type GraphEdge struct {
-	ID         string `json:"id"`
-	SrcID      string `json:"srcId"`
-	DstID      string `json:"dstId"`
-	Type       string `json:"type"`
-	SrcName    string `json:"srcName"`
-	DstName    string `json:"dstName"`
-	ValidFrom  int64  `json:"validFrom"`
-	ValidTo    int64  `json:"validTo"` // 0 = currently valid
-	RecordedAt int64  `json:"recordedAt"`
-	CrossTags  string `json:"crossTags"` // JSON array of library IDs (P7 cross-library)
-	Weight     int    `json:"weight"`    // consolidated count of identical relations
+	ID            string  `json:"id"`
+	SrcID         string  `json:"srcId"`
+	DstID         string  `json:"dstId"`
+	Type          string  `json:"type"`
+	SrcName       string  `json:"srcName"`
+	DstName       string  `json:"dstName"`
+	ValidFrom     int64   `json:"validFrom"`
+	ValidTo       int64   `json:"validTo"` // 0 = currently valid
+	RecordedAt    int64   `json:"recordedAt"`
+	CrossTags     string  `json:"crossTags"`     // JSON array of library IDs (P7 cross-library)
+	Weight        int     `json:"weight"`        // consolidated count of identical relations
+	Polarity      string  `json:"polarity,omitempty"`   // "positive"|"negative"|"neutral"
+	Intensity     float64 `json:"intensity,omitempty"`  // 0.0-1.0
+	Level         string  `json:"level,omitempty"`      // "parent"|"child"|"peer"
+	Confidence    float64 `json:"confidence,omitempty"` // 0.0-1.0
+	SourceChunkID string  `json:"sourceChunkId,omitempty"`
+	Evidence      string  `json:"evidence,omitempty"`
 }
 
 // GraphNode is an entity row for the UI viewer.
@@ -817,6 +823,220 @@ func (s *Store) NodeWorkspace(nodeID string) string {
 		return ""
 	}
 	return ws
+}
+
+// ─── Entity Timeline Queries ──────────────────────────────────────────
+
+// EntitySnapshot holds the complete state of an entity at a point in time.
+type EntitySnapshot struct {
+	EntityID   string            `json:"entityId"`
+	EntityName string            `json:"entityName"`
+	Properties []EntityProperty   `json:"properties"`
+	Edges      []GraphEdge       `json:"edges"`
+	Events     []KGEvent          `json:"events,omitempty"`
+	Spatial    []SpatialRecord    `json:"spatial,omitempty"`
+}
+
+// QueryEntityTimeline returns the full snapshot of an entity within a time range,
+// including its properties, relations, and events at that time.
+func (s *Store) QueryEntityTimeline(entityID string, from, to int64) (*EntitySnapshot, error) {
+	if entityID == "" {
+		return nil, fmt.Errorf("entity_id required")
+	}
+	es := &EntitySnapshot{EntityID: entityID}
+	_ = s.db.QueryRow(`SELECT COALESCE(name_raw, name) FROM kg_nodes WHERE id = ?`, entityID).Scan(&es.EntityName)
+
+	// Properties valid in [from, to] range
+	props, err := s.GetEntityProperties(entityID)
+	if err == nil {
+		for _, p := range props {
+			if from > 0 && p.ValidTo > 0 && p.ValidTo < from {
+				continue // property ended before range start
+			}
+			if to > 0 && p.ValidFrom > 0 && p.ValidFrom > to {
+				continue // property started after range end
+			}
+			es.Properties = append(es.Properties, p)
+		}
+	}
+
+	// Currently-valid edges
+	edges, err := s.ListEdgesForNode(entityID, 20)
+	if err == nil {
+		es.Edges = edges
+	}
+
+	// Events the entity participated in
+	events, err := s.GetEventsForEntity(entityID, 10)
+	if err == nil {
+		for _, ev := range events {
+			if from > 0 && ev.TimeEnd > 0 && ev.TimeEnd < from {
+				continue
+			}
+			if to > 0 && ev.TimeStart > 0 && ev.TimeStart > to {
+				continue
+			}
+			es.Events = append(es.Events, ev)
+		}
+	}
+
+	// Spatial records
+	spatial, err := s.GetSpatialForEntity(entityID)
+	if err == nil {
+		es.Spatial = spatial
+	}
+
+	return es, nil
+}
+
+// ─── Causal Chain Queries ────────────────────────────────────────────
+
+// CausalLink is a step in a causal chain.
+type CausalLink struct {
+	FromEvent KGEvent  `json:"fromEvent"`
+	ToEvent   KGEvent  `json:"toEvent"`
+	Edge      GraphEdge `json:"edge"`
+}
+
+// QueryCausalChain follows "causes" / "precedes" edges from a starting event
+// for up to `depth` steps. direction: "forward" (causes→) | "backward" (←caused_by)
+// | "both".
+func (s *Store) QueryCausalChain(eventID string, direction string, depth int) ([]CausalLink, error) {
+	if depth <= 0 {
+		depth = 3
+	}
+	if depth > 10 {
+		depth = 10 // safety cap
+	}
+
+	var links []CausalLink
+	visited := map[string]bool{eventID: true}
+
+	causalQuery := `SELECT e.id, e.src_id, e.dst_id, e.type,
+		COALESCE(e.polarity,''), COALESCE(e.intensity,0.5), COALESCE(e.confidence,1.0),
+		COALESCE(e.evidence,'')
+		FROM kg_edges e WHERE e.valid_to IS NULL AND e.type IN ('causes','precedes','leads_to')`
+
+	var expand func(currentID string, dir string, remaining int) error
+	expand = func(currentID string, dir string, remaining int) error {
+		if remaining <= 0 {
+			return nil
+		}
+		if dir == "forward" || dir == "both" {
+			r, err := s.db.Query(causalQuery+" AND e.src_id = ?", currentID)
+			if err == nil {
+				defer r.Close()
+				for r.Next() {
+					var id, srcID, dstID, typ, pol, evid string
+					var intens, conf float64
+					if err := r.Scan(&id, &srcID, &dstID, &typ, &pol, &intens, &conf, &evid); err != nil {
+						continue
+					}
+					if visited[dstID] {
+						continue
+					}
+					visited[dstID] = true
+					fromEv, _ := s.GetEvent(currentID)
+					toEv, _ := s.GetEvent(dstID)
+					if fromEv != nil && toEv != nil {
+						links = append(links, CausalLink{
+							FromEvent: *fromEv,
+							ToEvent:   *toEv,
+							Edge:      GraphEdge{ID: id, SrcID: srcID, DstID: dstID, Type: typ, Polarity: pol, Intensity: intens, Confidence: conf, Evidence: evid},
+						})
+					}
+					expand(dstID, dir, remaining-1)
+				}
+			}
+		}
+		if dir == "backward" || dir == "both" {
+			r, err := s.db.Query(causalQuery+" AND e.dst_id = ?", currentID)
+			if err == nil {
+				defer r.Close()
+				for r.Next() {
+					var id, srcID, dstID, typ, pol, evid string
+					var intens, conf float64
+					if err := r.Scan(&id, &srcID, &dstID, &typ, &pol, &intens, &conf, &evid); err != nil {
+						continue
+					}
+					if visited[srcID] {
+						continue
+					}
+					visited[srcID] = true
+					fromEv, _ := s.GetEvent(srcID)
+					toEv, _ := s.GetEvent(currentID)
+					if fromEv != nil && toEv != nil {
+						links = append(links, CausalLink{
+							FromEvent: *fromEv,
+							ToEvent:   *toEv,
+							Edge:      GraphEdge{ID: id, SrcID: srcID, DstID: dstID, Type: typ, Polarity: pol, Intensity: intens, Confidence: conf, Evidence: evid},
+						})
+					}
+					expand(srcID, dir, remaining-1)
+				}
+			}
+		}
+		return nil
+	}
+
+	if err := expand(eventID, direction, depth); err != nil {
+		return links, err
+	}
+	return links, nil
+}
+
+// ─── Spatial Context Query ──────────────────────────────────────────
+
+// SpatialResult is an entity or event with a spatial record matching a query.
+type SpatialResult struct {
+	SpatialRecord
+	EntityName  string `json:"entityName,omitempty"`
+	EntityType  string `json:"entityType,omitempty"`
+	EventTitle  string `json:"eventTitle,omitempty"`
+}
+
+// QuerySpatialContext returns entities and events matching a spatial query
+// (region name LIKE search).
+func (s *Store) QuerySpatialContext(region string, limit int) ([]SpatialResult, error) {
+	if region == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.Query(`SELECT sp.id, COALESCE(sp.entity_id,''), COALESCE(sp.event_id,''),
+		sp.spatial_type, COALESCE(sp.coordinates,''), COALESCE(sp.address,''),
+		COALESCE(sp.region,''), COALESCE(sp.named_location,''),
+		COALESCE(sp.valid_from,0), COALESCE(sp.valid_to,0),
+		sp.confidence, COALESCE(sp.source_chunk_id,''), sp.recorded_at
+		FROM kg_spatial sp
+		WHERE sp.region LIKE ? OR sp.named_location LIKE ? OR sp.address LIKE ?
+		ORDER BY sp.confidence DESC LIMIT ?`,
+		"%"+region+"%", "%"+region+"%", "%"+region+"%", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SpatialResult
+	for rows.Next() {
+		var sr SpatialResult
+		if err := rows.Scan(&sr.ID, &sr.EntityID, &sr.EventID,
+			&sr.SpatialType, &sr.Coordinates, &sr.Address,
+			&sr.Region, &sr.NamedLocation,
+			&sr.ValidFrom, &sr.ValidTo,
+			&sr.Confidence, &sr.SourceChunkID, &sr.RecordedAt); err != nil {
+			return nil, err
+		}
+		// Enrich with entity/event names
+		if sr.EntityID != "" {
+			_ = s.db.QueryRow(`SELECT COALESCE(name_raw, name), COALESCE(type, '') FROM kg_nodes WHERE id = ?`, sr.EntityID).Scan(&sr.EntityName, &sr.EntityType)
+		}
+		if sr.EventID != "" {
+			_ = s.db.QueryRow(`SELECT title FROM kg_events WHERE id = ?`, sr.EventID).Scan(&sr.EventTitle)
+		}
+		out = append(out, sr)
+	}
+	return out, rows.Err()
 }
 
 // ListNodeWorkspaces returns the distinct (workspace_id, count) pairs for graph

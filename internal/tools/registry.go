@@ -114,6 +114,7 @@ func RegisterAll() {
 	registerPlanTools()
 	registerTaskBoardTools()
 	registerContextTools()
+	registerParadigmTools()
 }
 
 // registerContextTools registers context-management meta-tools.
