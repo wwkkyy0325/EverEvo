@@ -8,7 +8,7 @@ import { wikiApi } from '../api/wiki'
 import { knowledgeApi } from '../api/knowledge'
 import { useActiveLibrary } from '../composables/useActiveLibrary'
 import { useAsyncStore } from './asyncStore'
-import { getModelProfile, type ModelProfile } from '../config/modelProfiles'
+import { getModelProfile, refreshModelRegistry, type ModelProfile } from '../config/modelProfiles'
 import type { MemorySession, MemoryMessage } from '../api/memory'
 
 // Cross-view: last graph recall trace (seed/edge ids). The Knowledge viewer reads
@@ -953,6 +953,9 @@ export const useChatStore = defineStore('chat', () => {
       if (cfg?.llm) {
         activeId.value = cfg.llm.activeProvider || ''
       }
+      // Refresh the backend model registry so context management uses
+      // the authoritative capability data (not just local presets).
+      refreshModelRegistry().catch(() => {})
     } catch (_) { /* use defaults */ }
   }
 

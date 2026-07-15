@@ -154,6 +154,8 @@ func (a *App) resolveActiveProvider() (*config.LLMProvider, error) {
 // resolveExtractionProvider returns the provider used for memory fact/graph
 // extraction (LLMConfig.ExtractionProvider), falling back to the active provider
 // when unset or unavailable. Lets extraction target a cheaper model than chat.
+// When no explicit extraction provider is set, uses task routing to prefer
+// local models (saves cloud credits).
 func (a *App) resolveExtractionProvider() (*config.LLMProvider, error) {
 	if id := a.cfg.LLM.ExtractionProvider; id != "" {
 		for i := range a.cfg.LLM.Providers {
@@ -161,6 +163,10 @@ func (a *App) resolveExtractionProvider() (*config.LLMProvider, error) {
 				return &a.cfg.LLM.Providers[i], nil
 			}
 		}
+	}
+	// No explicit extraction provider — try task routing (prefer local models)
+	if best := config.FindBestModel(a.cfg.LLM.Providers, "extraction"); best != nil {
+		return best, nil
 	}
 	return a.resolveActiveProvider()
 }

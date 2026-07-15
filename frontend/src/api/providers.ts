@@ -45,6 +45,20 @@ export interface ModelCapability {
   maxContextTokens: number
 }
 
+/** Unified model profile from the backend registry. */
+export interface ModelRegistryEntry {
+  label: string
+  contextWindow: number
+  maxOutputTokens: number
+  effectivePct: number
+  compactPct: number
+  supportsThinkingBudget: boolean
+  providerId: string
+  providerName: string
+  modelName: string
+  capabilities: ModelCapability
+}
+
 export interface Preset {
   type: string
   name: string
@@ -76,4 +90,6 @@ export const providersApi = {
   fetchOpenAIModels(base: string, key: string) { return call(() => App().FetchOpenAIModels(base, key)) },
   fetchDeepSeekModels(apiKey: string) { return call<any[]>(() => App().FetchDeepSeekModels(apiKey)) },
   queryBalance(providerID: string) { return call<BalanceInfo>(() => App().QueryBalance(providerID)) },
+  getModelRegistry() { return call<ModelRegistryEntry[]>(() => App().GetModelRegistry()) },
+  findBestModelForTask(task: string) { return call<Provider | null>(() => App().FindBestModelForTask(task)) },
 }

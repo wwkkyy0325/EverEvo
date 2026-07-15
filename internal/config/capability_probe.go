@@ -221,7 +221,12 @@ func probeOpenAIAPI(ctx context.Context, endpoint, apiKey, model string) *ModelC
 
 	wg.Wait()
 
-	// Context window probe (fast, sequential is fine)
+	// Context window probe (fast, sequential is fine).
+	// Only return what the API actually reports — do NOT merge with
+	// knownContextDefault here. That fallback lives in LookupModelProfile
+	// and is used by the context management layer. Merging here would
+	// overwrite a user's manually-configured context (e.g. 24K for a
+	// model whose family default is 128K).
 	if ctx.Err() == nil {
 		if c := probeContextOpenAI(client, base, apiKey, model); c > 0 {
 			cap.MaxContextTokens = c

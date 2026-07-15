@@ -1,16 +1,17 @@
 /**
- * Model Profile Configuration — declarative per-model settings.
+ * Model Profile Configuration — unified, backend-driven.
  *
- * Replaces heuristics ("if DeepSeek V4 → 1M") with explicit profiles.
- * Edit the MODEL_PRESETS map below to add or tune models.
+ * The backend's GetModelRegistry() is the single source of truth.
+ * Local MODEL_PRESETS serve as an offline fallback only.
  *
- * Design:
- *   - Each model is keyed by a slug (case-insensitive substring match against
- *     provider name + model name).
- *   - The first matching preset wins; fallback_profile is used when nothing matches.
- *   - All values are user-editable — no magic numbers buried in code.
- *   - To override: edit MODEL_PRESETS, or wire a settings UI later.
+ * Lookup priority:
+ *   1. Backend registry cache (populated on app load)
+ *   2. Local MODEL_PRESETS (offline / fallback)
+ *   3. FALLBACK_PROFILE (conservative default)
  */
+
+import { providersApi } from '@/api'
+import type { ModelRegistryEntry } from '@/api'
 
 // ── Types ──
 
@@ -20,32 +21,55 @@ export interface ModelProfile {
   /** Model context window in tokens. */
   contextWindow: number
   /** Maximum output tokens the API accepts.
-   *  Set to 0 to omit max_tokens entirely (let the model/server decide —
-   *  this is what Codex does). Set to a positive value only for APIs that
-   *  REQUIRE it (Anthropic). */
+   *  Set to 0 to omit max_tokens entirely (let the model/server decide). */
   maxOutputTokens: number
-  /** Percentage of context window usable for input (system + history + recall).
-   *  Codex uses 95%; the remaining 5% is reserved for overhead + output. */
+  /** Percentage of context window usable for input (system + history + recall). */
   effectivePct: number
-  /** Percentage of context window at which auto-compaction triggers.
-   *  Codex uses 90% (auto_compact_token_limit = context_window * 0.9). */
+  /** Percentage of context window at which auto-compaction triggers. */
   compactPct: number
-  /** Whether this provider supports a separate thinking/reasoning token budget
-   *  (Anthropic: budget_tokens). When false, thinking counts against max_tokens. */
+  /** Whether this provider supports a separate thinking/reasoning token budget. */
   supportsThinkingBudget: boolean
 }
 
-// ── Built-in Presets ──
+// ── Backend Registry Cache ──
+
+/** Cached registry from the backend. Keyed by "providerName modelName" (lowercase). */
+let _registryCache: Map<string, ModelRegistryEntry> | null = null
+
+/**
+ * Fetch and cache the backend model registry.
+ * Call this once on app startup (or when providers change).
+ */
+export async function refreshModelRegistry(): Promise<void> {
+  try {
+    // Guard: providersApi may not be ready during early module init.
+    if (!providersApi?.getModelRegistry) return
+    const entries = await providersApi.getModelRegistry()
+    if (!entries?.length) return
+    _registryCache = new Map()
+    for (const entry of entries) {
+      const key = `${entry.providerName} ${entry.modelName}`.toLowerCase()
+      _registryCache.set(key, entry)
+    }
+  } catch (e) {
+    console.warn('[modelProfiles] failed to refresh backend registry:', e)
+  }
+}
+
+/** Check if the backend registry has been loaded. */
+export function hasBackendRegistry(): boolean {
+  return _registryCache !== null && _registryCache.size > 0
+}
+
+// ── Local Presets (offline fallback) ──
 
 /** Source: official docs, API responses, and Codex models.json reference. */
 export const MODEL_PRESETS: Record<string, ModelProfile> = {
   // ── DeepSeek ──
-  // Current models (2026-07): deepseek-v4-flash, deepseek-v4-pro.
-  // Both: 1M context. max_tokens is optional for DeepSeek — omit it (0).
   'deepseek-v4-pro': {
     label: 'DeepSeek V4 Pro',
     contextWindow: 1_000_000,
-    maxOutputTokens: 0,          // optional: let API default, model stops at finish_reason="stop"
+    maxOutputTokens: 0,
     effectivePct: 95,
     compactPct: 90,
     supportsThinkingBudget: false,
@@ -66,14 +90,6 @@ export const MODEL_PRESETS: Record<string, ModelProfile> = {
     compactPct: 90,
     supportsThinkingBudget: false,
   },
-  'deepseek-reasoner': {
-    label: 'DeepSeek V4 (legacy: deepseek-reasoner)',
-    contextWindow: 1_000_000,
-    maxOutputTokens: 0,
-    effectivePct: 95,
-    compactPct: 90,
-    supportsThinkingBudget: false,
-  },
   'deepseek': {
     label: 'DeepSeek (latest / unknown model)',
     contextWindow: 1_000_000,
@@ -87,15 +103,15 @@ export const MODEL_PRESETS: Record<string, ModelProfile> = {
   'claude opus': {
     label: 'Claude Opus 4+',
     contextWindow: 200_000,
-    maxOutputTokens: 128_000,    // Opus max output
+    maxOutputTokens: 128_000,
     effectivePct: 95,
     compactPct: 90,
-    supportsThinkingBudget: true, // budget_tokens separate
+    supportsThinkingBudget: true,
   },
   'claude sonnet': {
     label: 'Claude Sonnet 4+',
     contextWindow: 200_000,
-    maxOutputTokens: 64_000,     // Sonnet max output
+    maxOutputTokens: 64_000,
     effectivePct: 95,
     compactPct: 90,
     supportsThinkingBudget: true,
@@ -121,7 +137,7 @@ export const MODEL_PRESETS: Record<string, ModelProfile> = {
   'gpt-5': {
     label: 'GPT-5 / GPT-5.x',
     contextWindow: 272_000,
-    maxOutputTokens: 0,          // optional for Chat Completions
+    maxOutputTokens: 0,
     effectivePct: 95,
     compactPct: 90,
     supportsThinkingBudget: false,
@@ -147,14 +163,6 @@ export const MODEL_PRESETS: Record<string, ModelProfile> = {
   'gemini 2.5': {
     label: 'Gemini 2.5+',
     contextWindow: 1_000_000,
-    maxOutputTokens: 0,          // optional
-    effectivePct: 95,
-    compactPct: 90,
-    supportsThinkingBudget: true,
-  },
-  'gemini 3': {
-    label: 'Gemini 3+',
-    contextWindow: 1_000_000,
     maxOutputTokens: 0,
     effectivePct: 95,
     compactPct: 90,
@@ -168,16 +176,70 @@ export const MODEL_PRESETS: Record<string, ModelProfile> = {
     compactPct: 90,
     supportsThinkingBudget: true,
   },
+
+  // ── Qwen / Tongyi (local) ──
+  'qwen2.5-coder-3b': {
+    label: 'Qwen2.5 Coder 3B',
+    contextWindow: 32_768,
+    maxOutputTokens: 0,
+    effectivePct: 90,
+    compactPct: 85,
+    supportsThinkingBudget: false,
+  },
+  'qwen2.5-coder': {
+    label: 'Qwen2.5 Coder',
+    contextWindow: 32_768,
+    maxOutputTokens: 0,
+    effectivePct: 90,
+    compactPct: 85,
+    supportsThinkingBudget: false,
+  },
+  'qwen': {
+    label: 'Qwen (generic)',
+    contextWindow: 131_072,
+    maxOutputTokens: 0,
+    effectivePct: 90,
+    compactPct: 85,
+    supportsThinkingBudget: false,
+  },
+
+  // ── Llama (local) ──
+  'llama-3': {
+    label: 'Llama 3',
+    contextWindow: 8_192,
+    maxOutputTokens: 0,
+    effectivePct: 90,
+    compactPct: 85,
+    supportsThinkingBudget: false,
+  },
+  'llama': {
+    label: 'Llama (generic)',
+    contextWindow: 8_192,
+    maxOutputTokens: 0,
+    effectivePct: 85,
+    compactPct: 80,
+    supportsThinkingBudget: false,
+  },
+
+  // ── Mistral (local) ──
+  'mistral': {
+    label: 'Mistral (generic)',
+    contextWindow: 32_000,
+    maxOutputTokens: 0,
+    effectivePct: 90,
+    compactPct: 85,
+    supportsThinkingBudget: false,
+  },
 }
 
 // ── Fallback for unknown models ──
 
 export const FALLBACK_PROFILE: ModelProfile = {
   label: 'Unknown Model (conservative fallback)',
-  contextWindow: 128_000,
-  maxOutputTokens: 128_000,
-  effectivePct: 80,    // conservative for unknown models
-  compactPct: 80,      // compact earlier to be safe
+  contextWindow: 32_768,
+  maxOutputTokens: 0,
+  effectivePct: 80,
+  compactPct: 80,
   supportsThinkingBudget: false,
 }
 
@@ -185,15 +247,46 @@ export const FALLBACK_PROFILE: ModelProfile = {
 
 /**
  * Find the best-matching ModelProfile for a provider+model string.
- * Matches case-insensitively against keys of MODEL_PRESETS.
- * Returns FALLBACK_PROFILE when no key matches.
+ * Priority: backend registry → local presets → fallback.
  */
 export function getModelProfile(providerName?: string, modelName?: string): ModelProfile {
-  const haystack = `${providerName || ''} ${modelName || ''}`.toLowerCase()
+  const haystack = `${providerName || ''} ${modelName || ''}`.toLowerCase().trim()
+
+  // Guard: empty input → conservative fallback (don't match the first entry)
+  if (!haystack) return FALLBACK_PROFILE
+
+  // 1. Backend registry (authoritative)
+  if (_registryCache) {
+    // Try exact match first
+    const exact = _registryCache.get(haystack)
+    if (exact) return entryToProfile(exact)
+    // Try substring match — key must be a substring of haystack (not reverse)
+    for (const [key, entry] of _registryCache) {
+      if (haystack.includes(key)) {
+        return entryToProfile(entry)
+      }
+    }
+  }
+
+  // 2. Local presets (offline fallback)
   for (const [key, profile] of Object.entries(MODEL_PRESETS)) {
     if (haystack.includes(key)) return profile
   }
+
+  // 3. Conservative default
   return FALLBACK_PROFILE
+}
+
+/** Convert a backend ModelRegistryEntry to the frontend ModelProfile shape. */
+function entryToProfile(entry: ModelRegistryEntry): ModelProfile {
+  return {
+    label: entry.label,
+    contextWindow: entry.contextWindow,
+    maxOutputTokens: entry.maxOutputTokens,
+    effectivePct: entry.effectivePct,
+    compactPct: entry.compactPct,
+    supportsThinkingBudget: entry.supportsThinkingBudget,
+  }
 }
 
 /**

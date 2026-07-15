@@ -8,7 +8,7 @@ require (
 	github.com/larksuite/oapi-sdk-go/v3 v3.9.8
 	github.com/philippgille/chromem-go v0.7.0
 	github.com/sugarme/tokenizer v0.3.0
-	github.com/wailsapp/wails/v2 v2.13.0
+	github.com/wailsapp/wails/v2 v2.12.0
 	github.com/yalue/onnxruntime_go v1.31.0
 	github.com/yuin/goldmark v1.7.4
 	golang.org/x/sys v0.46.0

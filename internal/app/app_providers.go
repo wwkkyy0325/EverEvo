@@ -422,3 +422,66 @@ func (a *App) ProbeAllModels(providerID string) map[string]config.ModelCapabilit
 	}
 	return result
 }
+
+// ModelRegistryEntry is a single entry in the model registry returned to the
+// frontend. It merges the preset profile with any probed capabilities.
+type ModelRegistryEntry struct {
+	config.ModelProfile
+	ProviderID   string                `json:"providerId"`
+	ProviderName string                `json:"providerName"`
+	ModelName    string                `json:"modelName"`
+	Capabilities config.ModelCapability `json:"capabilities"`
+}
+
+// GetModelRegistry returns the unified model registry: every model across all
+// providers, with preset profiles merged with probed capabilities. The frontend
+// uses this as its single source of truth for context management.
+func (a *App) GetModelRegistry() []ModelRegistryEntry {
+	if a.cfg == nil {
+		return nil
+	}
+	var entries []ModelRegistryEntry
+	for _, p := range a.cfg.LLM.Providers {
+		if !p.Enabled {
+			continue
+		}
+		// If provider has an explicit model list, register each
+		if len(p.Models) > 0 {
+			for _, modelName := range p.Models {
+				profile := config.LookupModelProfile(p.Name, modelName)
+				cap := p.ModelCapabilities[modelName]
+				profile = config.MergeWithCapability(profile, cap)
+				entries = append(entries, ModelRegistryEntry{
+					ModelProfile: profile,
+					ProviderID:   p.ID,
+					ProviderName: p.Name,
+					ModelName:    modelName,
+					Capabilities: cap,
+				})
+			}
+		} else if p.Model != "" {
+			// Single-model provider (no model list)
+			profile := config.LookupModelProfile(p.Name, p.Model)
+			cap := p.ModelCapabilities[p.Model]
+			profile = config.MergeWithCapability(profile, cap)
+			entries = append(entries, ModelRegistryEntry{
+				ModelProfile: profile,
+				ProviderID:   p.ID,
+				ProviderName: p.Name,
+				ModelName:    p.Model,
+				Capabilities: cap,
+			})
+		}
+	}
+	return entries
+}
+
+// FindBestModelForTask selects the best provider for a task type.
+// Returns nil if no suitable provider is found.
+// Task types: "vision", "tools", "reasoning", "extraction", "chat".
+func (a *App) FindBestModelForTask(task string) *config.LLMProvider {
+	if a.cfg == nil {
+		return nil
+	}
+	return config.FindBestModel(a.cfg.LLM.Providers, task)
+}

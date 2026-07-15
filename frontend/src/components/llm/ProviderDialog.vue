@@ -198,6 +198,7 @@
 import { ref, reactive, computed, watch, nextTick } from 'vue'
 import { useToast } from '../../composables/useToast'
 import { providersApi } from '../../api/providers'
+import { getModelProfile } from '../../config/modelProfiles'
 
 // ── Props ──
 const props = defineProps<{
@@ -557,8 +558,17 @@ async function probeCapabilities() {
     if (_probeTimer) { clearTimeout(_probeTimer); _probeTimer = null }
     if (_detectCancelId !== token) { probing.value = false; return }
     if (!provForm.modelCapabilities) provForm.modelCapabilities = {}
+    // Merge with existing capability — preserve manually-configured context
+    // when the probe returns 0 (llama.cpp / Ollama don't expose context via API).
+    const existing = provForm.modelCapabilities[model]
+    if (existing && existing.maxContextTokens > 0 && (!cap.maxContextTokens || cap.maxContextTokens === 0)) {
+      cap.maxContextTokens = existing.maxContextTokens
+    }
     provForm.modelCapabilities[model] = cap
     if (props.editingProv) await saveProviderSilent()
+    // Look up the model profile for additional context (label, tuning params)
+    const profile = getModelProfile(provForm.name, model)
+    const ctxDisplay = cap.maxContextTokens || profile.contextWindow
     const tags = [
       cap.supportsVision ? '👁多模态' : '✗视觉',
       cap.supportsTools ? '🔧工具' : '✗工具',
@@ -566,9 +576,11 @@ async function probeCapabilities() {
       cap.supportsStreaming ? '⇢流式' : '✗流式',
       cap.supportsJSON ? '{}JSON' : '✗JSON',
       cap.supportsFIM ? '⟷FIM' : '✗FIM',
-      fmtCtx(cap.maxContextTokens) + '上下文'
+      fmtCtx(ctxDisplay) + '上下文'
     ]
-    provMsg.value = model + ' 能力: ' + tags.join(' ')
+    const profileHint = profile.label !== 'Unknown Model (conservative fallback)'
+      ? ` [${profile.label}]` : ''
+    provMsg.value = model + profileHint + ' 能力: ' + tags.join(' ')
     provOk.value = true
   } catch (e: any) {
     if (_probeTimer) { clearTimeout(_probeTimer); _probeTimer = null }
