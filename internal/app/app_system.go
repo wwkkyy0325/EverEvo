@@ -18,6 +18,7 @@ import (
 	"everevo/internal/backends"
 	"everevo/internal/backends/onnx"
 	"everevo/internal/config"
+	"everevo/internal/shell"
 	"everevo/internal/httpclient"
 	"everevo/internal/storage"
 	"everevo/internal/sysinfo"
@@ -219,6 +220,12 @@ var dangerousCmdPatterns = []struct {
 
 // ShellExec runs a command through the OS shell with safety guards:
 // dangerous-pattern blocking, timeout enforcement, and output truncation.
+//
+// Execution strategy (via internal/shell package):
+//   - Direct os/exec when no shell features detected (≈80% of commands)
+//     Arguments parsed and passed separately — no quoting issues, no CWE-78.
+//   - Shell via SysProcAttr.CmdLine when pipes/redirects/chaining needed
+//     Uses Go-recommended cmd.exe /s /c approach for correct quoting.
 func (a *App) ShellExec(command string, cwd string, timeoutSec int) (map[string]any, error) {
 	// ── Safety gate 1: dangerous pattern check ──
 	for _, d := range dangerousCmdPatterns {
@@ -244,60 +251,33 @@ func (a *App) ShellExec(command string, cwd string, timeoutSec int) (map[string]
 		}
 	}
 
-	// ── Build command ──
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
-	defer cancel()
-
-	var cmd *exec.Cmd
-	if isWindowsShell() {
-		cmd = exec.CommandContext(ctx, "cmd", "/c", command)
-	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", command)
+	// ── Execute via shell package ──
+	sr, err := shell.Execute(context.Background(), command, shell.Options{
+		Cwd:     cwd,
+		Timeout: time.Duration(timeoutSec) * time.Second,
+	})
+	if err != nil {
+		return nil, err
 	}
-	cmd.Dir = cwd
 
-	// ── Run ──
-	start := time.Now()
-	output, err := cmd.CombinedOutput()
-	elapsed := time.Since(start).Milliseconds()
-
-	// ── Build result ──
+	// ── Build result (backward-compatible format) ──
 	result := map[string]any{
-		"exitCode": 0,
-		"stdout":   "",
-		"stderr":   "",
-		"cwd":      cwd,
-		"duration": fmt.Sprintf("%dms", elapsed),
+		"exitCode": sr.ExitCode,
+		"stdout":   sr.Stdout,
+		"stderr":   sr.Stderr,
+		"cwd":      sr.Cwd,
+		"duration": sr.DurationMs,
 	}
 
 	// Truncate output to avoid flooding context (50KB max).
 	const maxOutput = 50 * 1024
-	outStr := string(output)
-	if len(outStr) > maxOutput {
-		outStr = outStr[:maxOutput] + fmt.Sprintf("\n\n…(输出已截断，共 %d bytes)", len(output))
-	}
-	result["stdout"] = outStr
-
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			result["exitCode"] = exitErr.ExitCode()
-			result["stderr"] = err.Error()
-		} else if ctx.Err() == context.DeadlineExceeded {
-			result["exitCode"] = -1
-			result["stderr"] = fmt.Sprintf("命令超时 (%ds)", timeoutSec)
-			return result, nil // timeout is not a Go error — return result with exit code
-		} else {
-			result["exitCode"] = -1
-			result["stderr"] = err.Error()
-		}
+	if len(sr.Stdout) > maxOutput {
+		result["stdout"] = sr.Stdout[:maxOutput] + fmt.Sprintf("\n\n…(输出已截断，共 %d bytes)", len(sr.Stdout))
 	}
 
 	return result, nil
 }
 
-func isWindowsShell() bool {
-	return os.PathSeparator == '\\'
-}
 
 // ─── Web Search (DuckDuckGo) ─────────────────────────────────
 

@@ -39,7 +39,7 @@ export interface FactHit { content: string; category: string }
 /** Result of recall: past Q&A turns + extracted facts + a knowledge-graph context block. */
 export interface GraphTrace { seedIds: string[]; edgeIds: string[] }
 
-export interface RecallResult { turns: TurnHit[]; facts: FactHit[]; graph: string; graphTrace: GraphTrace; core: UserFact[] }
+export interface RecallResult { turns: TurnHit[]; facts: FactHit[]; graph: string; graphTrace: GraphTrace; core: UserFact[]; coreSearch: FactHit[]; experience: FactHit[] }
 
 /** A permanent core-memory fact (identity/preference/constraint). */
 export interface UserFact { id: string; key: string; value: string; category: string; importance: string; locked: boolean; source: string; createdAt: number }

@@ -7,9 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"everevo/internal/agents"
+	"everevo/internal/async"
 	"everevo/internal/collab"
 	"everevo/internal/config"
 	"everevo/internal/memory"
@@ -32,11 +36,14 @@ type Deps struct {
 	ChatCompletion func(p *config.LLMProvider, messagesJSON, toolsJSON json.RawMessage, opts ChatOpts) (map[string]any, error)
 	CallTool       func(name string, params map[string]any) tools.ToolResult
 	Collab         *collab.Kernel
+	CommandQueue   *async.CommandQueue   // async notification queue
+	AgentTaskState *async.AgentTaskState  // running agent task registry
+	TaskManager    *async.Manager         // persistent task storage
 	// EnrichSystemPrompt is called by buildAgentSystemPrompt to inject
 	// per-turn context: thinking language control, paradigm recommendations, etc.
 	// base is the agent's persona prompt; userQuery is the current user message.
 	// Returns the enriched system prompt.
-	EnrichSystemPrompt func(base string, userQuery string) string
+	EnrichSystemPrompt func(base string, userQuery string, libraryID string) string
 }
 
 // ChatOpts mirrors the app.chatOpts struct so the plugin doesn't import app.
@@ -54,6 +61,16 @@ var d *Deps
 // SetDeps wires the execution runtime dependencies. Call once at startup.
 func SetDeps(deps *Deps) {
 	d = deps
+	if deps == nil {
+		log.Printf("[agent] ⚠ SetDeps called with nil deps!")
+	} else {
+		log.Printf("[agent] SetDeps OK: AgentManager=%v, MemoryStore=%v, AgentTaskState=%v, CommandQueue=%v",
+			deps.AgentManager != nil,
+			deps.MemoryStore != nil,
+			deps.AgentTaskState != nil,
+			deps.CommandQueue != nil,
+		)
+	}
 }
 
 // ─── Agent Chat Context (frontend-facing) ─────────────────────────────
@@ -184,13 +201,20 @@ func buildOrchestratorPrompt(agent *agents.Agent, userQuery string) string {
 		base = "你是 EverEvo 的 AI 助手，遵循 ReAct（推理-行动）框架工作。\n\n## 工作流程\n1. 分析需求 → 2. 调用工具 → 3. 观察结果 → 4. 重复直至完成 → 5. 最终回答（简洁中文，不照搬 JSON）\n\n## 工具规则\n- 先思考再行动，失败换方案\n- JSON 提取关键字段，不要整套贴出\n- 不需要工具就直接回答\n\n---\n\n" + base
 	}
 
-	// 2. Skill context — compact: titles only
+	// 2. Skill context — titles + systemPrompts (expert knowledge)
 	var skillTitles []string
+	var skillPrompts []string
 	for _, s := range agentSelectedSkills(agent) {
 		skillTitles = append(skillTitles, fmt.Sprintf("%s %s", s.Icon, s.Title))
+		if strings.TrimSpace(s.SystemPrompt) != "" {
+			skillPrompts = append(skillPrompts, fmt.Sprintf("【%s】%s", s.Title, s.SystemPrompt))
+		}
 	}
 	if len(skillTitles) > 0 {
 		base += "\n\n已启用的能力角色：" + strings.Join(skillTitles, "、")
+	}
+	if len(skillPrompts) > 0 {
+		base += "\n\n## 能力角色详细指引\n\n" + strings.Join(skillPrompts, "\n\n")
 	}
 
 	// 3. ThinkLang rule (per-turn)
@@ -205,7 +229,7 @@ func buildOrchestratorPrompt(agent *agents.Agent, userQuery string) string {
 
 	// 5. Per-turn enrichments from Deps (memory/wiki/rag context provided by caller)
 	if d != nil && d.EnrichSystemPrompt != nil {
-		base = d.EnrichSystemPrompt(base, userQuery)
+		base = d.EnrichSystemPrompt(base, userQuery, agent.LibraryID)
 	}
 
 	return base
@@ -443,6 +467,128 @@ func RunAgentLoopCollab(ctx context.Context, agent *agents.Agent, userText, coll
 	}
 }
 
+// ─── Async Agent Execution ──────────────────────────────────────────
+
+// RunAgentLoopAsync launches an agent as a fire-and-forget background task.
+// Mirrors Claude Code's AgentTool async path: register → detach → enqueue result.
+//
+// Main agent ↔ sub-agent separation:
+//   - Sub-agent gets isolated context (own ctx, own messages, agent-scoped tools)
+//   - Main conversation continues immediately (non-blocking)
+//   - Result enqueued to CommandQueue for injection at next turn boundary
+func RunAgentLoopAsync(agent *agents.Agent, userText, sessionID string) (taskID string, err error) {
+	if d == nil {
+		log.Printf("[agent] RunAgentLoopAsync: d (package-level Deps) is nil — SetDeps was never called or d was reset")
+		return "", fmt.Errorf("agent 执行环境未初始化 — Deps 未注入（SetDeps 未被调用）")
+	}
+	if d.AgentTaskState == nil {
+		log.Printf("[agent] RunAgentLoopAsync: d is set but d.AgentTaskState is nil — init order issue")
+		return "", fmt.Errorf("agent 执行环境未初始化 — AgentTaskState 为 nil（初始化顺序问题）")
+	}
+
+	provider, err := resolveAgentProvider(agent)
+	if err != nil {
+		return "", err
+	}
+
+	taskID = "at_" + uuid.NewString()
+	bgCtx, cancel := context.WithCancel(context.Background())
+
+	// Register in the in-memory task registry.
+	d.AgentTaskState.Register(&async.AgentTask{
+		Task: async.Task{
+			ID: taskID, SessionID: sessionID,
+			Title: agent.Name + ": " + truncateText(userText, 60),
+			Status: "running",
+		},
+		AgentName:  agent.Name,
+		AgentID:    agent.ID,
+		ProviderID: provider.ID,
+		Model:      provider.Model,
+		CancelFn:   cancel,
+		IsAsync:    true,
+	})
+
+	// Persist via TaskManager if available.
+	if d.TaskManager != nil {
+		ctxJSON, _ := json.Marshal(map[string]any{
+			"agentId": agent.ID, "agentName": agent.Name,
+			"providerId": provider.ID, "model": provider.Model,
+		})
+		if t, cerr := d.TaskManager.Create(sessionID, agent.Name+": "+truncateText(userText, 60),
+			"agent_run_async", userText, string(ctxJSON)); cerr == nil {
+			taskID = t.ID // use the persisted task ID
+			d.TaskManager.Start(taskID)
+		}
+	}
+
+	// Fire-and-forget: run agent in background goroutine.
+	go func() {
+		defer d.AgentTaskState.Remove(taskID)
+		defer cancel()
+
+		result, runErr := RunAgentLoopCollab(bgCtx, agent, userText, "")
+
+		// Persist result.
+		if d.TaskManager != nil {
+			if runErr != nil {
+				d.TaskManager.Fail(taskID, runErr.Error())
+			} else {
+				d.TaskManager.Complete(taskID, result)
+			}
+		}
+
+		// Enqueue notification for the main conversation loop.
+		entry := &async.QueueEntry{
+			Priority:  async.PriorityNow,
+			TaskID:    taskID,
+			AgentName: agent.Name,
+		}
+		if runErr != nil {
+			entry.Kind = "agent_error"
+			entry.Content = runErr.Error()
+		} else {
+			entry.Kind = "agent_done"
+			entry.Content = result
+		}
+		if d.CommandQueue != nil {
+			d.CommandQueue.Enqueue(entry)
+		}
+
+		if runErr != nil {
+			log.Printf("[agent] async %s (%s) failed: %v", agent.Name, taskID, runErr)
+		} else {
+			log.Printf("[agent] async %s (%s) completed (%d chars)", agent.Name, taskID, len(result))
+		}
+	}()
+
+	return taskID, nil
+}
+
+// DrainAgentNotifications returns pending async agent results for injection
+// into the main conversation context.
+func DrainAgentNotifications() []*async.QueueEntry {
+	if d == nil || d.CommandQueue == nil {
+		return nil
+	}
+	return d.CommandQueue.Drain()
+}
+
+// CancelAgentTask cancels a running async agent by task ID.
+func CancelAgentTask(taskID string) {
+	if d != nil && d.AgentTaskState != nil {
+		d.AgentTaskState.Cancel(taskID)
+	}
+}
+
+func truncateText(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max-1]) + "…"
+}
+
 // ─── Domain System Prompt ─────────────────────────────────────────────
 
 // BuildDomainSystemPrompt generates a domain-scoped system prompt fragment.
@@ -507,6 +653,6 @@ func BuildDomainSystemPrompt(domainId string) string {
 		mcpBlock = "\n## 可用 MCP 工具\n" + strings.Join(mcpLines, "\n") + "\n"
 	}
 
-	return fmt.Sprintf("\n【当前领域：%s】\n你是该领域的专家。领域上下文将自动注入相关的知识库、记忆和图谱数据。%s%s%s",
+	return fmt.Sprintf("\n【当前领域：%s】\n你是该领域的专家。回答问题时优先使用本领域的知识库文档、记忆和图谱（已自动注入上下文）。领域内无法解答时，用 `library_list` 查看其他领域库，或最后才使用 `web_search` 联网搜索。%s%s%s",
 		domainName, agentsBlock, skillsBlock, mcpBlock)
 }

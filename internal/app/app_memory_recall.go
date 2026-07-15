@@ -26,7 +26,7 @@ func (a *App) MemoryRecall(query string, k int) (map[string]any, error) {
 // last turn). Returns {turns,facts,graph,graphTrace,core}; empty arrays when
 // no embedding model is bound or no memories exist.
 func (a *App) MemoryRecallScoped(query string, k int, libraryID string) (map[string]any, error) {
-	empty := map[string]any{"turns": []any{}, "facts": []any{}, "graph": "", "graphTrace": map[string]any{"seedIds": []any{}, "edgeIds": []any{}}, "core": []any{}}
+	empty := map[string]any{"turns": []any{}, "facts": []any{}, "graph": "", "graphTrace": map[string]any{"seedIds": []any{}, "edgeIds": []any{}}, "core": []any{}, "coreSearch": []any{}, "experience": []any{}}
 	if a.memoryStore == nil || !a.memoryStore.HasVector() {
 		return empty, nil
 	}
@@ -54,7 +54,19 @@ func (a *App) MemoryRecallScoped(query string, k int, libraryID string) (map[str
 	// P2: graph retrieval reuses the same embedding (no double-embedding).
 	graph, _ := a.memoryStore.RetrieveGraph(emb, k, libraryID)
 	graphTrace := a.memoryStore.RetrieveGraphTrace(emb, k, libraryID)
-	// Core memory is GLOBAL (identity/preferences), shared across all domains.
+	// Core facts: semantic vector search (new, kind=core_fact).
+	// Falls back to SQL ListUserFacts for legacy un-vectorized facts.
+	coreSearch, _ := a.memoryStore.QueryCoreFacts(emb, k, libraryID)
+	if coreSearch == nil {
+		coreSearch = []memory.FactHit{}
+	}
+	// Experience: semantic vector search (kind=experience).
+	expHits, _ := a.memoryStore.QueryExperience(emb, k, libraryID)
+	if expHits == nil {
+		expHits = []memory.FactHit{}
+	}
+	// Legacy SQL core facts — supplement when vector results are sparse
+	// (pre-vectorization facts have no chromem entry).
 	core, _ := a.memoryStore.ListUserFacts("")
 	if core == nil {
 		core = []memory.UserFact{}
@@ -66,7 +78,7 @@ func (a *App) MemoryRecallScoped(query string, k int, libraryID string) (map[str
 	if len(recalledIDs) > 0 {
 		a.memoryStore.BumpScore(recalledIDs, true, time.Now().UnixMilli())
 	}
-	return map[string]any{"turns": turns, "facts": facts, "graph": graph, "graphTrace": graphTrace, "core": core}, nil
+	return map[string]any{"turns": turns, "facts": facts, "graph": graph, "graphTrace": graphTrace, "core": core, "coreSearch": coreSearch, "experience": expHits}, nil
 }
 
 // MemoryRemember stores a finalized user→assistant turn (the question is

@@ -36,6 +36,13 @@ type Skill struct {
 // builtinSkills defines the default skills bundled with EverEvo.
 var builtinSkills = []Skill{
 	{
+		Name: "paradigm-thinking", Title: "思维范式", Icon: "🧠",
+		Description: "选择并应用思维范式（MECE、根因分析、SWOT等）来结构化思考和解决问题",
+		Category:    "thinking", Package: "everevo", Enabled: true,
+		Tools:     []string{"paradigm_match", "paradigm_select", "paradigm_list", "paradigm_feedback", "paradigm_refine", "paradigm_distill"},
+		SystemPrompt: "你是思维范式专家。面对复杂任务时，先用 paradigm_match 根据任务描述匹配最适合的思维范式，然后用 paradigm_select 加载完整方法论，严格按其步骤执行。完成后用 paradigm_feedback 提交效果反馈。常用范式包括：MECE分解、根因分析、系统思维、SWOT分析、第一性原理、权衡矩阵、事前验尸、逆向思维、类比推理、SCAMPER头脑风暴、二分排除法、假设检验驱动调试、分治法、SMART目标、ReAct标准、结构化诊断分析、对比决策、逐步执行、反思优化。",
+	},
+	{
 		Name: "model-management", Title: "模型管理", Icon: "□",
 		Description: "管理已下载和已加载的 AI 模型：加载、卸载、运行推理、查看已下载模型列表",
 		Category:    "model", Package: "everevo", Enabled: true,
@@ -124,8 +131,8 @@ var builtinSkills = []Skill{
 		Name: "agent-orchestration", Title: "智能体编排", Icon: "◉",
 		Description: "管理本地 Agent（智能体人格）：列出、按需创建专门角色、把子任务委派给指定 Agent 执行",
 		Category:    "agent", Package: "everevo", Enabled: true,
-		Tools:     []string{"agent_list", "agent_create", "agent_set_library", "agent_run", "agent_delegate_to_domain", "agent_delegate_multi_domain", "agent_synthesize_tool", "memory_list", "memory_search", "memory_delete", "memory_add_fact", "memory_clear", "core_list", "core_add", "core_delete", "session_list", "session_delete", "graph_list", "graph_add_edge", "graph_delete_node", "graph_rename_node", "graph_migrate", "graph_rebuild_from_domain", "experience_list", "experience_delete", "library_list", "library_create", "library_delete", "a2a_list_agents", "a2a_connect_agent", "a2a_disconnect_agent", "a2a_send_to_agent", "a2a_agent_status"},
-		SystemPrompt: "你是智能体编排中枢。当遇到需要专门角色的子任务（如翻译、代码审查、数据分析等），先用 agent_list 查看可用 Agent，再用 agent_run 委派；若没有合适的 Agent，可用 agent_create 按需创建一个（需提供名称、用途和完整系统提示词）。也可用 a2a_list_agents 查看远端 Agent，a2a_send_to_agent 向远端派发任务。委派后把子 Agent 的回复整合给用户，不要原样转述其内部思考。",
+		Tools:     []string{"agent_list", "agent_create", "agent_set_library", "agent_run", "agent_run_async", "agent_delegate_to_domain", "agent_delegate_multi_domain", "agent_synthesize_tool", "memory_list", "memory_search", "memory_delete", "memory_add_fact", "memory_clear", "core_list", "core_add", "core_delete", "session_list", "session_delete", "graph_list", "graph_add_edge", "graph_delete_node", "graph_rename_node", "graph_migrate", "graph_rebuild_from_domain", "experience_list", "experience_delete", "library_list", "library_create", "library_delete", "a2a_list_agents", "a2a_connect_agent", "a2a_disconnect_agent", "a2a_send_to_agent", "a2a_agent_status"},
+		SystemPrompt: "你是智能体编排中枢。当需要专门角色的子任务时：先用 agent_list 查看可用 Agent；多独立子任务用 agent_run_async（非阻塞）同时启动多个 Agent 并行执行；需要等待结果的用 agent_run（阻塞）。若没有合适的 Agent，用 agent_create 按需创建。也可用 a2a_list_agents 查看远端 Agent，a2a_send_to_agent 向远端派发。委派后整合子 Agent 的回复，不要原样转述内部思考。",
 		},
 		{
 			Name: "taskboard", Title: "任务板", Icon: "📋",

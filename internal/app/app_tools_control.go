@@ -12,6 +12,7 @@ import (
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"everevo/internal/memory"
+	"everevo/internal/async"
 	"everevo/internal/taskboard"
 	"everevo/internal/tools"
 )
@@ -640,6 +641,35 @@ func hIngestDeep(a *App, p map[string]any) tools.ToolResult {
 		return tools.ErrMsg("path 不能为空")
 	}
 	libID := a.resolveLibraryID(tools.GetString(p, "libraryId"))
+	// Fire-and-forget: deep ingest can take minutes. Return task ID immediately,
+	// result arrives via auto-continue notification injection.
+	if a.asyncManager != nil {
+		task, err := a.asyncManager.Create("", "深度导入: "+path, "ingest_deep", path, `{"path":"`+path+`","libraryId":"`+libID+`"}`)
+		if err == nil {
+			a.asyncManager.Start(task.ID)
+			go func() {
+				result, runErr := a.IngestDeep(path, libID)
+				if runErr != nil {
+					a.asyncManager.Fail(task.ID, runErr.Error())
+				} else {
+					b, _ := json.Marshal(result)
+					a.asyncManager.Complete(task.ID, string(b))
+				}
+				// Enqueue notification for auto-continue.
+				if a.commandQueue != nil {
+					entry := &async.QueueEntry{Priority: async.PriorityNow, TaskID: task.ID, Kind: "agent_done"}
+					if runErr != nil {
+						entry.Content = runErr.Error()
+					} else {
+						entry.Content = fmt.Sprintf("深度导入完成: %s (%d 文件)", path, len(result.FileMetas))
+					}
+					a.commandQueue.Enqueue(entry)
+				}
+			}()
+			return tools.OkResult(map[string]any{"status": "async_launched", "taskId": task.ID, "hint": "深度导入已启动，完成后自动通知"})
+		}
+	}
+	// Fallback: sync execution
 	result, err := a.IngestDeep(path, libID)
 	if err != nil {
 		return tools.ErrResult(err)

@@ -28,7 +28,7 @@ func IsBlackboardTool(name string) bool {
 func IsOrchestrationTool(name string) bool {
 	switch name {
 	// orchestration (recursion / re-entry)
-	case "agent_list", "agent_create", "agent_set_library", "agent_run",
+	case "agent_list", "agent_create", "agent_set_library", "agent_run", "agent_run_async",
 		"library_list", "agent_delegate_to_domain", "agent_delegate_multi_domain",
 		"workflow_execute", "workflow_create", "workflow_update", "workflow_delete",
 		"agent_synthesize_tool",

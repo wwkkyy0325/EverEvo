@@ -302,12 +302,10 @@ export const useChatStore = defineStore('chat', () => {
   // Agents visible in the current domain: agents whose library matches the
   // active library, plus core agents from the default library (always shown).
   const visibleAgents = computed(() => {
-    const list = agents.value || []
-    const libId = activeLibraryId.value
-    if (!libId) return list
-    return list.filter(a =>
-      !a.libraryId || a.libraryId === libId || a.isDefault
-    )
+    // Coordinator mode: show ALL agents across all domains.
+    // The coordinator discovers domains via library_list and dispatches
+    // via agent_delegate_to_domain — domain filtering is counterproductive.
+    return agents.value || []
   })
 
   const selectedAgentName = computed(() => {
@@ -1487,14 +1485,8 @@ export const useChatStore = defineStore('chat', () => {
         messages.value.push({ id: _tempId(), role: 'assistant', content: '❗ 加载 Agent 失败: ' + errMsg(e) })
         return
       }
-      // P10: Append domain context even when using a specific agent.
-      const libId = activeLibraryId.value
-      if (libId) {
-        try {
-          const domainCtx = await go.BuildDomainSystemPrompt(libId)
-          if (domainCtx) systemContent += '\n' + domainCtx
-        } catch (_) { /* best-effort */ }
-      }
+      // Domain context is discovered by the coordinator at runtime
+      // via library_list — no static domain injection needed.
     } else {
       let enabledNames: string[]
       try { enabledNames = (await go.GetEnabledToolNames()) || [] } catch (_) { enabledNames = [] }
@@ -1537,27 +1529,19 @@ export const useChatStore = defineStore('chat', () => {
 - 用户说中文，用中文回复。每次回复尽量简洁直接。
 - 用户可通过拖拽或粘贴上传文件。文本文件（TXT/MD/CSV/JSON 等）内容会自动注入。PDF 和图片请用 read_file 或 read_media_file 工具读取。扫描件 PDF (isScanned=true) 请用 read_media_file 以图片形式查看。`
 
-      const skillPrompts = enabledSkills
-        .filter(s => s.systemPrompt)
-        .map(s => `【${s.title}】${s.systemPrompt}`)
-        .join('\n')
-      systemContent = skillPrompts
-        ? `${basePrompt}\n\n当前启用的能力角色：\n${skillPrompts}`
-        : basePrompt
-
-      // P10: Inject domain-scoped context (agents, skills, MCP, tools for this domain).
-      const libId = activeLibraryId.value
-      if (libId) {
-        try {
-          const domainCtx = await go.BuildDomainSystemPrompt(libId)
-          if (domainCtx) {
-            systemContent += '\n' + domainCtx
-          } else {
-            // Fallback: at minimum show which domain we're in.
-            systemContent += `\n【当前领域】${libId}`
-          }
-        } catch (_) { /* best-effort */ }
+      // Skills catalog: always list titles + descriptions (compact).
+      // Full systemPrompt bodies are loaded on-demand via tool invocation.
+      const skillLines = enabledSkills
+        .filter(s => s.enabled !== false)
+        .map(s => `- **${s.title}**：${s.description || ''}`)
+      if (skillLines.length) {
+        systemContent = basePrompt + '\n\n## 当前启用的能力角色\n' + skillLines.join('\n') +
+          '\n\n调用 `tool_search` 按名称或用途查找工具。'
+      } else {
+        systemContent = basePrompt
       }
+
+      // Domain scoping removed — coordinator discovers domains via library_list.
     }
 
     // Per-turn thinking language control: backend classifies the query for
@@ -1570,9 +1554,9 @@ export const useChatStore = defineStore('chat', () => {
       if (tlResult?.rule) systemContent += '\n\n' + tlResult.rule
     } catch (e) { console.warn('[chat] thinkLang classification failed:', errMsg(e)) }
 
-    // ── Paradigm list: full catalog (19 items, ~350 tokens) — LLM picks directly ──
+    // ── Paradigm list: full catalog — LLM picks directly ──
     try {
-      const allParadigms = await memoryApi.paradigmList() || []
+      const allParadigms = await memoryApi.paradigmList(activeLibraryId.value) || []
       const enabled = allParadigms.filter((p: any) => p.enabled !== false)
       if (enabled.length) {
         const lines = enabled.map((p: any) =>
@@ -1580,8 +1564,12 @@ export const useChatStore = defineStore('chat', () => {
         )
         systemContent += '\n\n---\n## 🧠 思维范式（选择后调用 `paradigm_select` 加载方法论）\n\n' + lines.join('\n')
         systemContent += '\n\n完成后调用 `paradigm_feedback(id, match, exec, outcome, "原因")` 提交反馈。'
+      } else {
+        console.warn('[chat] paradigm list returned empty — check paradigms.json')
       }
-    } catch (_) { /* best-effort */ }
+    } catch (e) {
+      console.warn('[chat] paradigm list failed:', errMsg(e))
+    }
 
     // P1.5: inject long-term semantic memory (cross-session recall).
     if (userQuery) {
@@ -1591,14 +1579,14 @@ export const useChatStore = defineStore('chat', () => {
       // Each source gets a portion; the final MEM_BLOCK_MAX is a hard safety net.
       const effWin = contextTarget.value
       const pct = (p: number) => Math.max(200, Math.floor(effWin * p / 100))
-      const BUDGET_CORE   = pct(1.5)  // identity/preferences
-      const BUDGET_SUMMARY = pct(1.0) // current session summary
+      const BUDGET_CORE   = pct(1.0)  // identity/preferences
+      const BUDGET_SUMMARY = pct(0.5) // current session summary
       const BUDGET_TURNS   = pct(4.0) // related historical Q&A
-      const BUDGET_FACTS   = pct(1.5) // extracted facts
+      const BUDGET_FACTS   = pct(3.0) // extracted facts
       const BUDGET_GRAPH   = pct(2.5) // knowledge graph entities + relations
-      const BUDGET_EXP     = pct(1.5) // distilled experience / lessons
+      const BUDGET_EXP     = pct(1.0) // distilled experience / lessons
       const BUDGET_KB      = pct(6.0) // RAG knowledge base chunks
-      const BUDGET_WIKI    = pct(4.0) // project docs (llmwiki)
+      const BUDGET_WIKI    = pct(3.0) // project docs (llmwiki)
       const MEM_BLOCK_MAX  = pct(20)  // overall safety net (~22% total)
       // Middle-truncation: keep head (60%) + tail (40%), drop middle.
       // Preserves both opening context and closing details (Codex-style).
@@ -1613,7 +1601,7 @@ export const useChatStore = defineStore('chat', () => {
       }
 
       try {
-        const result = await memoryApi.recall(userQuery, 3, activeLibraryId.value) || { turns: [], facts: [], graph: '', graphTrace: { seedIds: [], edgeIds: [] }, core: [] }
+        const result = await memoryApi.recall(userQuery, 3, activeLibraryId.value) || { turns: [], facts: [], graph: '', graphTrace: { seedIds: [], edgeIds: [] }, core: [], coreSearch: [], experience: [] }
         // P7.3: rule-based library routing — which domain libraries match this query?
         let libMatch = ''
         const q = userQuery.toLowerCase()
@@ -1634,70 +1622,93 @@ export const useChatStore = defineStore('chat', () => {
         const parts: string[] = []
         if (libMatch) parts.push(libMatch)
 
-        // P5: forced core memory (identity/preferences) — always injected, never decayed.
-        if (result.core?.length) {
-          parts.push('核心记忆（身份与偏好，永久）：\n' + _trunc(
-            result.core.map((f: any) => `- ${f.value}`).join('\n'), BUDGET_CORE))
-        }
-        // P3.6: session summary (already loaded via sessionList).
+        // ── Memory block: always show every section (Explicit Absence Labeling).
+        // Silent omission prevents the model from distinguishing "no data"
+        // from "broken pipeline." Research: SoK Agentic RAG (2026) STOP action;
+        // Agentic Curation (2026) H4 "reasoning about absence."
+        const EMPTY = '（暂无匹配数据）'
+        const memLines: string[] = []
+        // Core memory
+        const coreItems = (result.coreSearch?.length ? result.coreSearch : result.core) || []
+        memLines.push(coreItems.length
+          ? '├ 核心记忆（语义召回）：\n' + _trunc(
+              coreItems.map((f: any) => `│  - ${f.category ? '[' + f.category + '] ' : ''}${f.content || f.value}`).join('\n'), BUDGET_CORE)
+          : '├ 核心记忆（语义召回）：' + EMPTY)
+        // Session summary
         const curSession = sessions.value.find(s => s.id === currentSessionId.value)
-        if (curSession?.summary) {
-          parts.push('会话摘要：\n' + _trunc(curSession.summary, BUDGET_SUMMARY))
-        }
+        memLines.push(curSession?.summary
+          ? '├ 会话摘要：\n' + _trunc('│  ' + curSession.summary, BUDGET_SUMMARY)
+          : '├ 会话摘要：' + EMPTY)
+        // Historical Q&A
         if (result.turns?.length) {
-          parts.push('相关历史问答：\n' + _trunc(
-            result.turns.map((t, i) => `${i + 1}. 问：${t.content}\n   答：${t.reply}`).join('\n'), BUDGET_TURNS))
+          const REPLY_CAP = Math.max(200, Math.floor(BUDGET_TURNS / Math.max(result.turns.length, 1) / 2))
+          memLines.push('├ 相关历史问答：\n' + _trunc(
+            result.turns.map((t, i) =>
+              `│  ${i + 1}. 问：${t.content}\n│     答：${t.reply.length > REPLY_CAP ? t.reply.slice(0, REPLY_CAP) + '…' : t.reply}`
+            ).join('\n'), BUDGET_TURNS))
+        } else {
+          memLines.push('├ 相关历史问答：' + EMPTY)
         }
-        if (result.facts?.length) {
-          parts.push('已知事实：\n' + _trunc(
-            result.facts.map((f, i) => `${i + 1}. [${f.category}] ${f.content}`).join('\n'), BUDGET_FACTS))
-        }
-        // P2: knowledge graph — vector-seeded 2-hop expansion.
-        // Fall back to keyword-based node search when the vector path is empty.
+        // Extracted facts
+        memLines.push(result.facts?.length
+          ? '├ 已知事实：\n' + _trunc(
+              result.facts.map((f, i) => `│  ${i + 1}. [${f.category}] ${f.content}`).join('\n'), BUDGET_FACTS)
+          : '├ 已知事实：' + EMPTY)
+        // Knowledge graph
         let graphText = result.graph || ''
         if (!graphText) {
           try {
             graphText = await memoryApi.recallGraphContext(userQuery, activeLibraryId.value) || ''
           } catch (_) { /* best-effort */ }
         }
-        if (graphText) {
-          parts.push('知识图谱（相关实体与关系）：\n' + _trunc(graphText, BUDGET_GRAPH))
-        }
-        // P8: distilled experience recall
-        try {
-          const expItems = await memoryApi.recallExperience('', 3) || []  // experience is global, not domain-scoped
-          if (expItems.length) {
-            parts.push('经验教训（过去的反思沉淀）：\n' + _trunc(
-              expItems.map((e: any) => `- [${e.kind}] ${e.content}`).join('\n'), BUDGET_EXP))
-          }
-        } catch (_) { /* best-effort */ }
+        memLines.push(graphText
+          ? '├ 知识图谱：\n' + _trunc(graphText.split('\n').map(l => '│  ' + l).join('\n'), BUDGET_GRAPH)
+          : '├ 知识图谱：' + EMPTY)
+        // Experience / lessons
+        memLines.push(result.experience?.length
+          ? '├ 经验教训（语义召回）：\n' + _trunc(
+              result.experience.map((e: any) => `│  - [${e.category || 'insight'}] ${e.content}`).join('\n'), BUDGET_EXP)
+          : '├ 经验教训（语义召回）：' + EMPTY)
+
         lastGraphTrace.value = result.graphTrace || { seedIds: [], edgeIds: [] }
-        if (parts.length) {
-          let memBlock = parts.join('\n')
-          if (memBlock.length > MEM_BLOCK_MAX) memBlock = memBlock.slice(0, MEM_BLOCK_MAX) + '…'
-          systemContent += '\n\n长期记忆（与当前问题相关的过往信息，仅供参考，可能过时）：\n' + memBlock
-        }
+        let memBlock = memLines.join('\n')
+        if (memBlock.length > MEM_BLOCK_MAX) memBlock = memBlock.slice(0, MEM_BLOCK_MAX) + '…'
+        systemContent += '\n\n长期记忆（与当前问题相关的过往信息，仅供参考，可能过时）：\n' + memBlock
       } catch (e) { console.error('[chat] recall failed:', errMsg(e)) }
       // P6.1: project-docs recall (llmwiki) — surface relevant design/task notes.
       try {
         const wiki = await wikiApi.recall(activeLibraryId.value, userQuery)
         if (wiki) systemContent += '\n\n项目文档（与问题相关的设计/任务记录）：\n' + _trunc(wiki, BUDGET_WIKI)
       } catch (_) {}
-	      // P9: RAG knowledge base recall — auto-inject relevant KB chunks into context.
-	      try {
-	        const ragHits = await knowledgeApi.searchAllKBs(userQuery, activeLibraryId.value, 6, 3)
-	        if (ragHits?.length) {
-	          let ragBlock = ragHits.map((h: any) =>
-	            `[${h.kbName}, ${(h.similarity * 100).toFixed(0)}%] ${h.content}`
-	          ).join('\n')
-	          ragBlock = _trunc(ragBlock, BUDGET_KB)
-	          systemContent += '\n\n知识库检索结果（来自知识库的相关文档片段，请参考这些内容回答用户问题）：\n' + ragBlock
-	        }
-	      } catch (_) {}
+      // P9: RAG knowledge base recall — always show section (Explicit Absence).
+      try {
+        const ragHits = await knowledgeApi.searchAllKBs(userQuery, activeLibraryId.value, 6, 3)
+        if (ragHits?.length) {
+          systemContent += '\n\n知识库检索结果：\n' + _trunc(ragHits.map((h: any) => `[${h.kbName}, ${(h.similarity * 100).toFixed(0)}%] ${h.content}`).join('\n'), BUDGET_KB)
+        } else {
+          systemContent += '\n\n知识库检索结果：（暂无匹配）'
+        }
+      } catch (_) {
+        systemContent += '\n\n知识库检索结果：（检索失败）'
+      }
 	    }
 
-    // ── Tool discovery hint (replaces Token Budget noise) ──
-    systemContent += '\n\n💡 调用 `tool_search` 发现更多工具 | 思维范式: `paradigm_match` 匹配 → `paradigm_select` 加载方法论 → `paradigm_feedback` 反馈'
+    // ── Retrieval priority + Tool discovery ──
+    systemContent += '\n\n## 检索优先级\n' +
+      '1. 先查当前领域的知识库（已有记忆/文档/图谱已自动注入上下文）\n' +
+      '2. 如需跨领域，调用 `library_list` 查看其他领域库，用 `agent_delegate_to_domain` 委派\n' +
+      '3. 以上都无法回答时，才使用 `web_search` / `web_fetch` 联网搜索\n' +
+      '\n## 并行委派\n' +
+      '多个独立子任务同时调用 `agent_run_async`（非阻塞），结果自动注入后续对话。仅需等待结果时用 `agent_run`（阻塞）。\n' +
+      '\n💡 `tool_search` 发现更多工具 | 范式: `paradigm_match` → `paradigm_select` → `paradigm_feedback`'
+
+    // Strip any injected token-budget / context-window lines that may
+    // have been appended by the provider or runtime layer.
+    systemContent = systemContent
+      .split('\n')
+      .filter(l => !/Token.*预算|Context window|token.*budget/i.test(l))
+      .join('\n')
+      .trimEnd()
 
     const apiMsgs: APIMessage[] = normalizeToolMessages([
       { role: 'system', content: systemContent },
@@ -1738,13 +1749,51 @@ export const useChatStore = defineStore('chat', () => {
       }
     }
 
-    // No round cap (requested): the loop runs until the model returns a final
-    // answer (no more tool calls) or the user stops it. No iteration /
-    // productive budgets.
+    // No round cap: the loop runs until the model returns a final answer
+    // or the user stops it. No iteration / productive budgets.
     stopRequested.value = false
     currentStreamId.value = ''
     let round = 0
-    for (;;) {
+
+    // ── Conversation loop (user-initiated + auto-continue) ──
+    // Pattern: Claude Code drainCommandQueue → ask().
+    // Each background agent completion triggers an independent for(;;) turn.
+    while (true) {
+      // On subsequent iterations, drain pending agent notifications.
+      // If none, exit — the conversation is truly done.
+      if (round > 0) {
+        try {
+          const notes = await go.DrainAgentNotifications() || []
+          if (notes.length) {
+            for (const n of notes) {
+              let body = n.content || '(无输出)'
+              try { const p = JSON.parse(body); if (p.text) body = p.text; else if (p.error) body = '[错误] ' + p.error } catch (_) {}
+              const clean = body.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').replace(/\n/g, ' ').replace(/\t/g, ' ').slice(0, 400)
+              const s = n.kind === 'agent_error'
+                ? `[后台任务失败] ${n.agentName}: ${clean}`
+                : `[后台任务完成] ${n.agentName}: ${clean}`
+              apiMsgs.push({ role: 'user', content: s })
+              messages.value.push({ id: _tempId(), role: 'user', content: s })
+            }
+            messages.value.push({ id: _tempId(), role: 'system', content: `后台任务已完成（${notes.length} 个），正在续接对话…` })
+            console.log('[async] auto-continue: ' + notes.length + ' notification(s)')
+            // fall through to for(;;) below
+          } else {
+            // No notifications yet — check if agents are still running.
+            // Don't exit yet; poll and wait for them (Claude Code pattern).
+            try {
+              const running = await go.ListAgentTasks() || []
+              if (running.length > 0) {
+                await new Promise(r => setTimeout(r, 200)) // 200ms poll
+                continue // loop back, drain again
+              }
+            } catch (_) { /* best-effort */ }
+            break  // no notifications + no running agents → truly done
+          }
+        } catch (_) { break }
+      }
+
+      for (;;) {
       if (stopRequested.value) { busy.value = false; currentStreamId.value = ''; return }
       round++
       // ── Stale tool result pruning (save context space) ──
@@ -1960,23 +2009,52 @@ export const useChatStore = defineStore('chat', () => {
               messages.value[msgIdx].toolResults![idx].result = result
               messages.value[msgIdx] = { ...messages.value[msgIdx] }
             }
-            // Truncate oversized tool results: keep the result object FULL for the
-            // terminal widget (UI), but send a truncated version to the API.
-            // Strategy: drop verbose `data` field, keep head+tail if still too large.
-            const MAX_RESULT = 3000
-            const HEAD = 2000
-            const TAIL = 800
+            // Truncate oversized tool results before sending to the API.
+            // Go backend already applies per-tool output policies (CompactResult),
+            // so this is a safety net for extreme edge cases (e.g. raw MCP returns).
+            // Threshold is high enough to avoid double-truncating Go-processed results.
+            const MAX_RESULT = 50000
+            const HEAD = 8000
+            const TAIL = 4000
             let apiResultStr = JSON.stringify(result)
             if (apiResultStr.length > MAX_RESULT) {
-              // Try dropping the data field (usually the bulk of web_fetch/read_file).
-              if (result.data) {
+              // Try preserving data structure — truncate the content field inside data
+              // instead of replacing the entire data object.
+              if (result.data && typeof result.data === 'object' && !Array.isArray(result.data)) {
+                const dataObj = { ...result.data as Record<string, unknown> }
+                let slimmed = false
+                for (const key of Object.keys(dataObj)) {
+                  const val = dataObj[key]
+                  if (typeof val === 'string' && val.length > 2000) {
+                    const half = Math.floor((HEAD - 200) / 2)
+                    dataObj[key] = val.slice(0, half) +
+                      '\n…[截断 ' + (val.length - half * 2) + ' 字符]…\n' +
+                      val.slice(-Math.floor((TAIL - 200) / 2))
+                    slimmed = true
+                  }
+                }
+                if (slimmed) {
+                  const slim = { ...result, data: dataObj }
+                  apiResultStr = JSON.stringify(slim)
+                }
+              }
+              // If still too large or data is a simple string, fall back to head+tail truncation.
+              if (apiResultStr.length > MAX_RESULT) {
+                if (result.data && typeof result.data === 'string') {
+                  const dl = result.data.length
+                  const halfHead = Math.floor((HEAD - 300) / 2)
+                  const halfTail = Math.floor((TAIL - 300) / 2)
+                  result.data = result.data.slice(0, halfHead) +
+                    '\n…[截断 ' + (dl - halfHead - halfTail) + ' 字符]…\n' +
+                    result.data.slice(-halfTail)
+                  const slim = { ...result }
+                  apiResultStr = JSON.stringify(slim)
+                }
+              }
+              // Last resort: drop data entirely and mark as truncated.
+              if (apiResultStr.length > MAX_RESULT) {
                 const slim = { ...result, data: '[已截断，原始长度 ' + JSON.stringify(result.data).length + ' 字符]' }
                 apiResultStr = JSON.stringify(slim)
-              }
-              if (apiResultStr.length > MAX_RESULT) {
-                apiResultStr = apiResultStr.slice(0, HEAD) +
-                  '…[截断 ' + (apiResultStr.length - HEAD - TAIL) + ' 字符]…' +
-                  apiResultStr.slice(-TAIL)
               }
             }
             const toolMsg = { role: 'tool' as const, tool_call_id: tc.id, content: apiResultStr }
@@ -2013,11 +2091,10 @@ export const useChatStore = defineStore('chat', () => {
         console.error('[chat] round error:', msg)
         messages.value[msgIdx].content = '❗ 错误: ' + msg
       }
-      return
+      break  // LLM gave final answer → while(true) loops back to drain check
     }
-    // The for(;;) above has no break — the function returns from inside the loop.
-    // This line is unreachable and satisfies TypeScript's control-flow analysis.
-  }
+  }  // end while(true)
+  }  // end chatLoop
 
   return {
     // state

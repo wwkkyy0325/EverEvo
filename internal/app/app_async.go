@@ -8,6 +8,7 @@ import (
 	"log"
 	"time"
 
+agentPlugin "everevo/internal/plugins/tools/agents"
 	"everevo/internal/async"
 )
 
@@ -172,4 +173,70 @@ func truncateStr(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+// ─── Async Agent Execution (parallel sub-agent) ────────────────────
+
+// RunAgentAsync launches a sub-agent as a background task. Returns the
+// task ID immediately; the agent runs in a goroutine and its result
+// is enqueued for injection at the next conversation turn boundary.
+func (a *App) RunAgentAsync(agentID, userText, sessionID string) (map[string]any, error) {
+	if a.agentManager == nil {
+		return nil, fmt.Errorf("agent 管理器未就绪")
+	}
+	agent, err := a.agentManager.Get(agentID)
+	if err != nil {
+		return nil, err
+	}
+	taskID, err := agentPlugin.RunAgentLoopAsync(agent, userText, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"taskId":    taskID,
+		"agentName": agent.Name,
+		"status":    "async_launched",
+	}, nil
+}
+
+// DrainAgentNotifications returns pending async agent results for the
+// frontend to inject into the conversation before the next turn.
+func (a *App) DrainAgentNotifications() []map[string]any {
+	entries := agentPlugin.DrainAgentNotifications()
+	if entries == nil {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, map[string]any{
+			"taskId":    e.TaskID,
+			"agentName": e.AgentName,
+			"kind":      e.Kind,
+			"content":   e.Content,
+		})
+	}
+	return out
+}
+
+// CancelAgentTask cancels a running async agent by task ID.
+func (a *App) CancelAgentTask(taskID string) {
+	agentPlugin.CancelAgentTask(taskID)
+}
+
+// ListAgentTasks returns the currently running async agent tasks.
+func (a *App) ListAgentTasks() []map[string]any {
+	if a.agentTaskState == nil {
+		return nil
+	}
+	tasks := a.agentTaskState.List()
+	out := make([]map[string]any, 0, len(tasks))
+	for _, t := range tasks {
+		out = append(out, map[string]any{
+			"taskId":    t.ID,
+			"agentName": t.AgentName,
+			"status":    t.Status,
+			"title":     t.Title,
+		})
+	}
+	return out
 }

@@ -11,6 +11,7 @@ package memory
 
 import (
 	"encoding/json"
+	"crypto/rand"
 	"fmt"
 	"log"
 	"math"
@@ -211,6 +212,25 @@ func NewParadigmManager() *ParadigmManager {
 	loaded := loadParadigms()
 	if loaded != nil {
 		m.Paradigms = loaded
+			// Repair duplicate IDs (caused by pre-fix paradigmID that used high
+			// hex digits of timestamp — all builtins seeded in the same boot
+			// share the same ID). Detect and regenerate.
+			seenIDs := map[string]bool{}
+			hasDup := false
+			for _, p := range m.Paradigms {
+				if seenIDs[p.ID] {
+					hasDup = true
+					break
+				}
+				seenIDs[p.ID] = true
+			}
+			if hasDup {
+				log.Printf("[paradigm] detected duplicate IDs — regenerating all IDs")
+				for i := range m.Paradigms {
+					m.Paradigms[i].ID = paradigmID()
+				}
+				_ = m.Save()
+			}
 		existing := map[string]bool{}
 		for _, p := range m.Paradigms {
 			existing[p.Name] = true
@@ -613,7 +633,12 @@ func (m *ParadigmManager) EnsureLibraryIDs(defaultID string, validIDs []string) 
 }
 
 func paradigmID() string {
-	return "pd_" + fmt.Sprintf("%x", time.Now().UnixNano())[:12]
+	// 6 random bytes = 12 hex chars = 2^48 space.
+	// Timestamp-based IDs collide when seeding 19 builtins in a tight loop
+	// because the high hex digits of UnixNano barely change.
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("pd_%x", b)
 }
 
 func clamp(v, lo, hi float64) float64 {

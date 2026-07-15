@@ -60,6 +60,19 @@ func locateTokenizerJSON(modelPath string) string {
 // Encode 把文本编码为 BERT 三元组（input_ids / attention_mask / token_type_ids）。
 // 长度为实际 token 数（含 [CLS]/[SEP]，已截断到 maxLen），不 padding。
 func (t *Tokenizer) Encode(text string) (inputIds, attentionMask, tokenTypeIds []int64, err error) {
+	// Guard against tokenizer panics (sugarme/tokenizer has known slice-bounds bugs
+	// on edge-case unicode sequences). Recover and return an error instead of crashing.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("tokenizer panic (text len=%d): %v", len(text), r)
+			inputIds, attentionMask, tokenTypeIds = nil, nil, nil
+		}
+	}()
+	// Truncate very long text before tokenizing — the BERT tokenizer has a
+	// 512-token limit and long inputs trigger pathological edge cases.
+	if len(text) > 4096 {
+		text = text[:4096]
+	}
 	enc, err := t.tk.EncodeSingle(text, true)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("tokenize 失败: %w", err)

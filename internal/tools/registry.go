@@ -1,4 +1,4 @@
-// Deprecated: This is the legacy tool registration system. Tool schemas should
+﻿// Deprecated: This is the legacy tool registration system. Tool schemas should
 // be registered by implementing core.ToolPlugin (internal/core/plugin.go) and
 // calling core.GlobalTools.Register() during init(). See
 // internal/plugins/tools/ for examples.
@@ -108,6 +108,8 @@ func RegisterAll() {
 	registerProviderTools()
 	registerA2ATools()
 	registerAgentTools()
+		registerCodebaseTools()
+		registerDomainTools()
 	registerAppControlTools()
 	registerZoneTools()
 	registerCollabTools()

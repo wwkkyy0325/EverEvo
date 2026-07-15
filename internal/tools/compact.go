@@ -41,7 +41,7 @@ var toolOutputPolicies = map[string]OutputPolicy{
 	"kb_list_docs": {MaxBytes: 0},
 
 	// File reads — largest outputs
-	"read_file":       {MaxBytes: 12288, KeepHead: 3072, KeepTail: 2048, Summarizable: true},
+	"read_file":       {MaxBytes: 65536, KeepHead: 16384, KeepTail: 8192, Summarizable: true},
 	"read_media_file": {MaxBytes: 4096, KeepHead: 1024, KeepTail: 512},
 
 	// Catalog — can return many results
@@ -145,7 +145,20 @@ func CompactResult(name string, result ToolResult) (ToolResult, bool) {
 		return result, false
 	}
 
-	result.Data = json.RawMessage(truncated)
+	// Truncation cuts bytes at arbitrary positions — if the original Data
+	// was a JSON object/array, the cut may fall mid-structure, producing
+	// bytes that are no longer valid JSON. json.RawMessage.MarshalJSON()
+	// returns raw bytes directly; downstream json.Marshal(ToolResult) will
+	// then fail with "invalid character" on the broken structure.
+	//
+	// Fix: if truncated bytes are valid JSON, use them directly.
+	// Otherwise, wrap as an escaped JSON string so the pipeline stays safe.
+	if json.Valid(truncated) {
+		result.Data = json.RawMessage(truncated)
+	} else {
+		safe, _ := json.Marshal(string(truncated))
+		result.Data = json.RawMessage(safe)
+	}
 	return result, true
 }
 

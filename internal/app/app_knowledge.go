@@ -1,4 +1,4 @@
-//go:build windows
+﻿//go:build windows
 
 package app
 
@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"everevo/internal/memory"
 	"everevo/internal/config"
 	"everevo/internal/rag"
 	knowledgePlugin "everevo/internal/plugins/tools/knowledge"
@@ -291,4 +292,57 @@ func extractAssistantContent(result map[string]any) string {
 	}
 	content, _ := msg["content"].(string)
 	return content
+}
+
+// DomainSearch performs a read-only cross-domain search: KB + memory + graph
+// from the target domain library. Results are filtered by a divergence gate
+// (minSimilarity=0.15) per Agent KB (arXiv 2507.06229): cross-domain knowledge
+// must be relevant to the query to avoid noise injection.
+func (a *App) DomainSearch(query, targetLibraryID string, minSimilarity float64) (map[string]any, error) {
+	if targetLibraryID == "" {
+		return nil, fmt.Errorf("targetLibraryID is required")
+	}
+	if minSimilarity <= 0 {
+		minSimilarity = 0.15 // divergence gate default
+	}
+	result := map[string]any{}
+
+	// 1. KB search
+	if kbResults, err := a.SearchAllKnowledgeBases(query, targetLibraryID, 5, 3); err == nil {
+		var filtered []RagContextResult
+		for _, r := range kbResults {
+			if float64(r.Similarity) >= minSimilarity {
+				filtered = append(filtered, r)
+			}
+		}
+		if len(filtered) > 0 {
+			result["kb"] = filtered
+		}
+	}
+
+	// 2. Memory facts (semantic) + divergence gate
+	if a.memoryStore != nil && a.memoryStore.HasVector() {
+		dir := a.memoryStore.EmbeddingModelDir()
+		if dir != "" {
+			emb, err := rag.EmbedQuery(dir, query)
+			if err == nil {
+				if _, facts, err := a.memoryStore.QueryMemory(emb, 3, targetLibraryID); err == nil {
+					var filteredFacts []memory.FactHit
+					for _, f := range facts {
+						if float64(f.Similarity) >= minSimilarity {
+							filteredFacts = append(filteredFacts, f)
+						}
+					}
+					if len(filteredFacts) > 0 {
+						result["facts"] = filteredFacts
+					}
+				}
+				if graph, _ := a.memoryStore.RetrieveGraph(emb, 2, targetLibraryID); graph != "" {
+					result["graph"] = graph
+				}
+			}
+		}
+	}
+
+	return result, nil
 }

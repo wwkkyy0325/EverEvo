@@ -28,18 +28,6 @@
         </nav>
 
         <div class="nav-sep"></div>
-        <!-- Domain Switcher -->
-        <div v-if="!sidebarCollapsed" class="domain-switcher">
-          <select v-model="activeLibraryId" class="domain-select" title="切换领域">
-            <option v-for="lib in domainLibs" :key="lib.id" :value="lib.id">
-              {{ lib.icon || '📚' }} {{ lib.name }}
-            </option>
-          </select>
-          <span class="domain-indicator" title="当前领域">{{ currentDomainIcon }} {{ currentDomainName }}</span>
-        </div>
-        <div v-else class="domain-collapsed" title="切换领域">
-          <span class="domain-collapsed-icon">{{ currentDomainIcon }}</span>
-        </div>
         <div class="nav-sep"></div>
         <button class="nav-item chat-sidebar-toggle"
           :class="{ active: showChatPanel }"

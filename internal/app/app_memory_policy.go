@@ -99,7 +99,7 @@ func (a *App) MemoryCoreAdd(key, value, category string) error {
 	if a.memoryStore == nil {
 		return fmt.Errorf("记忆库未就绪")
 	}
-	if err := a.memoryStore.AddUserFact(uuid.NewString(), key, value, category, "high", "manual", ""); err != nil {
+	if err := a.memoryStore.AddUserFact(uuid.NewString(), key, value, category, "high", "manual", "", nil); err != nil {
 		return err
 	}
 	a.emitChanged("memory:changed", "core", "")

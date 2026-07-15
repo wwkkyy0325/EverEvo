@@ -81,15 +81,15 @@ func (a *App) maybeExtractFacts() {
 				crossTags = string(b)
 			}
 		}
+		emb, embErr := rag.EmbedQuery(dir, f.Content)
 		if f.Importance == "high" {
 			// Core: identity/preference/constraint — permanent, no decay/TTL.
-			if err := a.memoryStore.AddUserFact(uuid.NewString(), f.Category, f.Content, f.Category, "high", "extract", libID); err != nil {
+			if err := a.memoryStore.AddUserFact(uuid.NewString(), f.Category, f.Content, f.Category, "high", "extract", libID, emb); err != nil {
 				log.Printf("[memory] 核心事实写入失败: %v", err)
 			}
 			continue
 		}
-		emb, err := rag.EmbedQuery(dir, f.Content)
-		if err != nil {
+		if embErr != nil {
 			continue
 		}
 		if err := a.memoryStore.AddFactMemory(uuid.NewString(), f.Content, f.Category, f.Importance, libID, crossTags, emb); err != nil {
@@ -223,7 +223,12 @@ func (a *App) reflectOnCandidates(items []memory.MemoryItem) {
 			continue
 		}
 		id := uuid.NewString()
-		_ = a.memoryStore.AddExperience(id, libID, in.Kind, in.Content, in.Context, in.Confidence, now)
+			dir := a.memoryStore.EmbeddingModelDir()
+			var emb []float32
+			if dir != "" {
+				emb, _ = rag.EmbedQuery(dir, in.Content)
+			}
+		_ = a.memoryStore.AddExperience(id, libID, in.Kind, in.Content, in.Context, in.Confidence, now, emb)
 	}
 }
 
@@ -348,7 +353,12 @@ func (a *App) maybeReflect() {
 			continue
 		}
 		id := uuid.NewString()
-		if err := a.memoryStore.AddExperience(id, libID, in.Kind, in.Content, in.Context, in.Confidence, now); err != nil {
+			dir := a.memoryStore.EmbeddingModelDir()
+			var emb []float32
+			if dir != "" {
+				emb, _ = rag.EmbedQuery(dir, in.Content)
+			}
+		if err := a.memoryStore.AddExperience(id, libID, in.Kind, in.Content, in.Context, in.Confidence, now, emb); err != nil {
 			continue
 		}
 		stored++
@@ -948,7 +958,8 @@ func (a *App) scheduler() {
 			for _, f := range facts {
 				if strings.TrimSpace(f.Content) == "" { continue }
 				if f.Importance == "high" {
-					a.memoryStore.AddUserFact(uuid.NewString(), f.Category, f.Content, f.Category, "high", "extract", libID)
+					emb, _ := rag.EmbedQuery(dir, f.Content)
+					a.memoryStore.AddUserFact(uuid.NewString(), f.Category, f.Content, f.Category, "high", "extract", libID, emb)
 					continue
 				}
 				if dir != "" {
@@ -1027,7 +1038,12 @@ func (a *App) maybeReflectFrom(dialogue string) {
 			in.Kind = "insight"
 		}
 		id := uuid.NewString()
-		if err := a.memoryStore.AddExperience(id, libID, in.Kind, in.Content, in.Context, in.Confidence, now); err != nil {
+			dir := a.memoryStore.EmbeddingModelDir()
+			var emb []float32
+			if dir != "" {
+				emb, _ = rag.EmbedQuery(dir, in.Content)
+			}
+		if err := a.memoryStore.AddExperience(id, libID, in.Kind, in.Content, in.Context, in.Confidence, now, emb); err != nil {
 			continue
 		}
 		stored++

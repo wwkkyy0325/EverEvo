@@ -987,7 +987,8 @@ type UserFact struct {
 
 // AddUserFact inserts a core-memory row scoped to a domain library.
 // workspaceID empty → real default library (not the "default" sentinel).
-func (s *Store) AddUserFact(id, key, value, category, importance, source, workspaceID string) error {
+// emb, when non-nil, also stores the fact in the vector DB for semantic recall.
+func (s *Store) AddUserFact(id, key, value, category, importance, source, workspaceID string, emb []float32) error {
 	if importance == "" {
 		importance = "high"
 	}
@@ -1004,7 +1005,13 @@ func (s *Store) AddUserFact(id, key, value, category, importance, source, worksp
 	now := time.Now().UnixMilli()
 	_, err := s.db.Exec(`INSERT INTO user_facts(id, key, value, category, importance, locked, source, created_at, last_access, access_count, workspace_id)
 		VALUES(?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?)`, id, key, value, category, importance, source, now, now, workspaceID)
-	return err
+	if err != nil {
+		return err
+	}
+	if s.vector != nil && len(emb) > 0 {
+		_ = s.vector.AddCoreFact(id, value, category, workspaceID, emb)
+	}
+	return nil
 }
 
 // ListUserFacts returns core-memory rows (newest first).
@@ -1341,12 +1348,18 @@ func (s *Store) PruneEmptyAutoLibraries() (removed int) {
 // ─── Experience Items (P8) — reflection distilled insights ─────
 
 // AddExperience stores a distilled insight from the reflection loop.
-func (s *Store) AddExperience(id, workspaceID, kind, content, context string, confidence float64, now int64) error {
+func (s *Store) AddExperience(id, workspaceID, kind, content, context string, confidence float64, now int64, emb []float32) error {
 	_, err := s.db.Exec(
 		`INSERT INTO experience_items(id, workspace_id, kind, content, context, confidence, use_count, last_used, created_at)
 		 VALUES(?,?,?,?,?,?,0,0,?)`,
 		id, workspaceID, kind, content, context, confidence, now)
-	return err
+	if err != nil {
+		return err
+	}
+	if s.vector != nil && len(emb) > 0 {
+		_ = s.vector.AddExperience(id, content, kind, workspaceID, emb)
+	}
+	return nil
 }
 
 // DeleteExperience removes a single experience item by ID.
@@ -1648,6 +1661,23 @@ func (s *Store) QueryMemory(emb []float32, k int, libraryID string) (turns []Tur
 	turns = s.decayRankTurns(turns, p, now, rk)
 	facts = s.decayRankFacts(facts, p, now, rk)
 	return turns, facts, nil
+}
+
+// QueryCoreFacts runs semantic search over core facts (kind=core_fact).
+// Mirrors QueryMemory but for permanent identity/preference/constraint facts.
+func (s *Store) QueryCoreFacts(emb []float32, k int, libraryID string) ([]FactHit, error) {
+	if s.vector == nil {
+		return nil, nil
+	}
+	return s.vector.QueryCoreFacts(emb, k, libraryID)
+}
+
+// QueryExperience runs semantic search over experience/insight items (kind=experience).
+func (s *Store) QueryExperience(emb []float32, k int, libraryID string) ([]FactHit, error) {
+	if s.vector == nil {
+		return nil, nil
+	}
+	return s.vector.QueryExperience(emb, k, libraryID)
 }
 
 // memMeta carries the recency/importance columns used for decay re-rank.
@@ -2512,4 +2542,47 @@ func nullIfEmpty(s string) any {
 		return nil
 	}
 	return s
+}
+
+// ─── Codebase Import Helpers ──────────────────────────────────────
+
+// WikiSaveRaw writes a wiki page directly (bypasses the wiki package).
+func (s *Store) WikiSaveRaw(id, content, libraryID string) error {
+	if libraryID == "" {
+		libraryID = s.realDefaultLibrary()
+	}
+	now := time.Now().UnixMilli()
+	_, err := s.db.Exec(
+		`INSERT OR REPLACE INTO wiki_pages(id, path, content, library_id, updated_at)
+		 VALUES(?, ?, ?, ?, ?)`,
+		id, id, content, libraryID, now)
+	return err
+}
+
+// AddGraphNodeRaw inserts a KG node directly.
+func (s *Store) AddGraphNodeRaw(name, nodeType, libraryID string) error {
+	if libraryID == "" {
+		libraryID = s.realDefaultLibrary()
+	}
+	now := time.Now().UnixMilli()
+	id := fmt.Sprintf("nd_%x", now)
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO kg_nodes(id, name, type, library_id, created_at, updated_at)
+		 VALUES(?, ?, ?, ?, ?, ?)`,
+		id, name, nodeType, libraryID, now, now)
+	return err
+}
+
+// AddGraphEdgeRaw inserts a KG edge directly.
+func (s *Store) AddGraphEdgeRaw(from, predicate, to, libraryID string) error {
+	if libraryID == "" {
+		libraryID = s.realDefaultLibrary()
+	}
+	now := time.Now().UnixMilli()
+	id := fmt.Sprintf("ed_%x", now)
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO kg_edges(id, source, predicate, target, library_id, created_at, valid_from)
+		 VALUES(?, ?, ?, ?, ?, ?, ?)`,
+		id, from, predicate, to, libraryID, now, now)
+	return err
 }

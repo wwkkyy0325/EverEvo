@@ -28,7 +28,7 @@ func registerAgentTools() {
 	})
 	Register(&ToolDef{
 		Name:        "agent_run",
-		Description: "将一个任务委派给指定的本地 Agent 执行，并返回该 Agent 的最终回复。被委派的 Agent 会在自己的人格和能力范围内独立完成任务（可调用其工具），适合把专业子任务交给专门角色处理",
+		Description: "将一个任务委派给指定的本地 Agent 后台执行（非阻塞，立即返回任务 ID）。Agent 完成后结果自动注入后续对话。可同一轮多次调用来并行启动多个 Agent。如需阻塞等待结果，使用 agent_run_async 设置 wait=true",
 		Category:    "agent",
 		Parameters: &ToolParams{
 			Type: "object",
@@ -36,6 +36,20 @@ func registerAgentTools() {
 				"agentId": {Type: "string", Description: "目标 Agent 的 ID（来自 agent_list）。与 name 二选一"},
 				"name":    {Type: "string", Description: "目标 Agent 的名称（agentId 的替代，便于按名称委派）"},
 				"task":    {Type: "string", Description: "要交给该 Agent 执行的任务描述"},
+			},
+			Required: []string{"task"},
+		},
+	})
+	Register(&ToolDef{
+		Name:        "agent_run_async",
+		Description: "将一个任务委派给指定的本地 Agent 后台执行（非阻塞，立即返回任务 ID）。Agent 完成后结果自动注入下一轮对话。可同时调用多次来并行启动多个 Agent，各自独立执行，互不阻塞",
+		Category:    "agent",
+		Parameters: &ToolParams{
+			Type: "object",
+			Properties: map[string]ToolProp{
+				"agentId": {Type: "string", Description: "目标 Agent 的 ID（来自 agent_list）。与 name 二选一"},
+				"name":    {Type: "string", Description: "目标 Agent 的名称（agentId 的替代）"},
+				"task":    {Type: "string", Description: "要交给该 Agent 后台执行的任务描述"},
 			},
 			Required: []string{"task"},
 		},
@@ -101,6 +115,36 @@ func registerAgentTools() {
 				"libraryId": {Type: "string", Description: "目标领域库 ID（来自 library_list）。传空字符串则移回默认领域"},
 			},
 			Required: []string{"agentId", "libraryId"},
+		},
+	})
+}
+
+func registerCodebaseTools() {
+	Register(&ToolDef{
+		Name:        "codebase_import",
+		Description: "扫描项目 internal/ 目录的所有 Go 源码，生成 Wiki 页面（每个包）、知识图谱节点（导出类型）、图谱边（import 依赖）、RAG 向量块（源码分块）。一次运行完成全量代码库导入。libraryId 为空则使用默认领域",
+		Category:    "kb",
+		Parameters: &ToolParams{
+			Type: "object",
+			Properties: map[string]ToolProp{
+				"libraryId": {Type: "string", Description: "目标领域库 ID（可选，默认核心领域）"},
+			},
+		},
+	})
+}
+
+func registerDomainTools() {
+	Register(&ToolDef{
+		Name:        "domain_search",
+		Description: "跨领域只读检索。在指定的目标领域库中搜索知识库文档、语义记忆和知识图谱，返回合并结果。不会修改目标领域的任何数据。用于 Agent 需要引用其他领域知识时",
+		Category:    "kb",
+		Parameters: &ToolParams{
+			Type: "object",
+			Properties: map[string]ToolProp{
+				"query":    {Type: "string", Description: "搜索查询"},
+				"libraryId": {Type: "string", Description: "目标领域库 ID（来自 library_list）"},
+			},
+			Required: []string{"query", "libraryId"},
 		},
 	})
 }

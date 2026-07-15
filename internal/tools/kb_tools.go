@@ -133,7 +133,9 @@ func registerKBTools() {
 		Parameters: &ToolParams{
 			Type: "object",
 			Properties: map[string]ToolProp{
-				"path": {Type: "string", Description: "文件的绝对路径"},
+				"path":   {Type: "string", Description: "文件的绝对路径"},
+					"offset": {Type: "integer", Description: "起始行号（0=文件开头），用于分段读取"},
+					"limit":  {Type: "integer", Description: "最大读取行数（默认2000），用于分段读取"},
 			},
 			Required: []string{"path"},
 		},

@@ -214,7 +214,16 @@ func safeRawJSON(data json.RawMessage) json.RawMessage {
 		log.Printf("[chat] WARNING: invalid JSON passed as RawMessage: %v (first 200 chars: %.200q)", err, string(data))
 		return json.RawMessage("null")
 	}
-	return data
+	// Re-marshal to a fresh []byte — json.RawMessage.MarshalJSON() returns
+	// the underlying slice directly. If the original was part of a larger
+	// buffer (e.g. a shared HTTP body), it may contain trailing garbage
+	// that reads as unescaped control characters. Round-tripping through
+	// Marshal guarantees a clean, independent, compact JSON copy.
+	clean, err := json.Marshal(v)
+	if err != nil {
+		return json.RawMessage("null")
+	}
+	return json.RawMessage(clean)
 }
 
 // mustMarshal marshals v to JSON. On error it logs and returns "{}" instead of
@@ -222,7 +231,19 @@ func safeRawJSON(data json.RawMessage) json.RawMessage {
 func mustMarshal(v any) []byte {
 	bodyBytes, err := json.Marshal(v)
 	if err != nil {
-		log.Printf("[chat] FATAL: json.Marshal failed: %v", err)
+		log.Printf("[chat] json.Marshal failed (returning {}): %v", err)
+		return []byte("{}")
+	}
+	return bodyBytes
+}
+
+// mustMarshalCtx is like mustMarshal but includes provider/model context in the
+// error log so we can trace which LLM call produced the invalid JSON.
+func mustMarshalCtx(v any, p *config.LLMProvider, apiFormat string) []byte {
+	bodyBytes, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("[chat] json.Marshal failed (provider=%s model=%s fmt=%s, returning {}): %v",
+			p.Name, p.Model, apiFormat, err)
 		return []byte("{}")
 	}
 	return bodyBytes
@@ -309,16 +330,17 @@ func (a *App) chatCompletion(p *config.LLMProvider, messagesJSON, toolsJSON json
 	}
 
 	client := httpclient.New(60 * time.Second)
-	// Retry once on connection reset
+	// Retry on transient network failures (proxy resets, connection drops)
 	var resp *http.Response
 	var doErr error
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		resp, doErr = client.Do(httpReq)
 		if doErr == nil {
 			break
 		}
-		if attempt == 0 && strings.Contains(doErr.Error(), "forcibly closed") {
-			log.Printf("[chat] retrying after connection reset")
+		if attempt < 2 && strings.Contains(doErr.Error(), "forcibly closed") {
+			log.Printf("[chat] retry %d/3 after: %v", attempt+1, doErr)
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
 			httpReq, _ = http.NewRequest("POST", url, strings.NewReader(reqBody))
 			httpReq.Header.Set("Content-Type", "application/json")
 			httpReq.Header.Set(authHeader, authValue)
@@ -637,16 +659,17 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 
 		client := httpclient.New(300 * time.Second)
 			log.Printf("[chat] stream=%s POST %s bodyLen=%d", streamID, url, len(reqBody))
-	// Retry once on connection reset
+	// Retry on transient network failures (proxy resets, connection drops)
 	var resp *http.Response
 	var doErr error
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		resp, doErr = client.Do(httpReq)
 		if doErr == nil {
 			break
 		}
-		if attempt == 0 && strings.Contains(doErr.Error(), "forcibly closed") {
-			log.Printf("[chat] stream=%s retrying after connection reset", streamID)
+		if attempt < 2 && strings.Contains(doErr.Error(), "forcibly closed") {
+			log.Printf("[chat] stream interrupted, retry %d/3 after: %v", attempt+1, doErr)
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
 			httpReq, _ = http.NewRequest("POST", url, strings.NewReader(reqBody))
 			httpReq.Header.Set("Content-Type", "application/json")
 			httpReq.Header.Set(authHeader, authValue)

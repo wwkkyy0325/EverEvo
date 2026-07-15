@@ -81,6 +81,8 @@ type App struct {
 	acpBridge       *acp.Bridge                        // OpenCode ACP bridge for code modification tasks
 	taskBoard       *taskboard.Board
 	asyncManager    *async.Manager
+	commandQueue    *async.CommandQueue    // unified async result notification queue
+	agentTaskState  *async.AgentTaskState  // in-memory registry of running agent tasks
 	fileCtl         FileCtl                             // file access control (readonly/audit/full)
 }
 
@@ -256,6 +258,38 @@ func (a *App) Startup(ctx context.Context) {
 
 	log.Printf("已加载 %d 个本地 Agent", len(a.agentManager.List()))
 
+
+	// Wire agent execution plugin IMMEDIATELY after agent manager init.
+	// Must be before memory store and any conditional blocks — LLM tool
+	// calls (agent_run, agent_list) can arrive once the Wails frontend connects.
+	a.commandQueue = async.NewCommandQueue()
+	a.agentTaskState = async.NewAgentTaskState()
+	agentPlugin.SetDeps(&agentPlugin.Deps{
+		Cfg:          a.cfg,
+		SkillManager: a.skillManager,
+		AgentManager: a.agentManager,
+		MemoryStore:  a.memoryStore,
+		MCPClient:    a.mcpClient,
+		ChatCompletion: func(p *config.LLMProvider, messagesJSON, toolsJSON json.RawMessage, opts agentPlugin.ChatOpts) (map[string]any, error) {
+			return a.chatCompletion(p, messagesJSON, toolsJSON, chatOpts{
+				Temperature: opts.Temperature,
+				MaxTokens:   opts.MaxTokens,
+				ThinkEffort: opts.ThinkEffort,
+				OnChunk:     opts.OnChunk,
+				Ctx:         opts.Ctx,
+			})
+		},
+		CallTool: a.CallTool,
+		Collab:   a.collab,
+		CommandQueue:   a.commandQueue,
+		AgentTaskState: a.agentTaskState,
+		TaskManager:    a.asyncManager,
+		EnrichSystemPrompt: func(base, userQuery, libraryID string) string {
+			return a.enrichAgentPrompt(base, userQuery, libraryID)
+		},
+	})
+	log.Println("Agent 执行插件已就绪")
+
 	// Initialize collaboration kernel (event bus, blackboard, dispatcher).
 	// Forwards backend collab events to the Wails frontend for visualization,
 	// AND records every event into the unified activity log (single chokepoint).
@@ -413,29 +447,7 @@ func (a *App) Startup(ctx context.Context) {
 			}
 		}
 	}
-	// Wire agent execution plugin with all runtime dependencies.
-	agentPlugin.SetDeps(&agentPlugin.Deps{
-		Cfg:          a.cfg,
-		SkillManager: a.skillManager,
-		AgentManager: a.agentManager,
-		MemoryStore:  a.memoryStore,
-		MCPClient:    a.mcpClient,
-		ChatCompletion: func(p *config.LLMProvider, messagesJSON, toolsJSON json.RawMessage, opts agentPlugin.ChatOpts) (map[string]any, error) {
-			return a.chatCompletion(p, messagesJSON, toolsJSON, chatOpts{
-				Temperature: opts.Temperature,
-				MaxTokens:   opts.MaxTokens,
-				ThinkEffort: opts.ThinkEffort,
-				OnChunk:     opts.OnChunk,
-				Ctx:         opts.Ctx,
-			})
-		},
-		CallTool: a.CallTool,
-		Collab:   a.collab,
-		EnrichSystemPrompt: func(base, userQuery string) string {
-			return a.enrichAgentPrompt(base, userQuery)
-		},
-	})
-	log.Println("Agent 执行插件已就绪")
+
 
 	// Initialize OpenCode ACP bridge for code modification delegation.
 	a.acpBridge = acp.NewBridge(acp.DefaultExe)

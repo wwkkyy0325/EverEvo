@@ -88,6 +88,24 @@ func (v *VectorStore) AddEntity(nodeID, name, entityType, workspaceID string, em
 	})
 }
 
+// AddCoreFact stores a high-importance core-fact vector (kind=core_fact).
+// Core facts are identity/preference/constraint items that are permanent
+// and never decayed. They live alongside turn/fact/entity in the same
+// chromem collection, distinguished by kind metadata.
+func (v *VectorStore) AddCoreFact(id, content, category, workspaceID string, emb []float32) error {
+	return v.AddWithEmbedding(id, content, emb, map[string]string{
+		"kind": "core_fact", "category": category, "itemId": id, "ws": workspaceID,
+	})
+}
+
+// AddExperience stores a reflection/distilled insight vector (kind=experience).
+// These are reusable lessons from the dream/reflection pipeline.
+func (v *VectorStore) AddExperience(id, content, expKind, workspaceID string, emb []float32) error {
+	return v.AddWithEmbedding(id, content, emb, map[string]string{
+		"kind": "experience", "expKind": expKind, "itemId": id, "ws": workspaceID,
+	})
+}
+
 // Delete removes documents by ID (orphan cleanup on memory/node deletion).
 func (v *VectorStore) Delete(ids ...string) error {
 	v.mu.Lock()
@@ -163,6 +181,43 @@ func (v *VectorStore) QueryFacts(emb []float32, k int, libraryID string) ([]Fact
 	out := make([]FactHit, 0, len(res))
 	for _, r := range res {
 		out = append(out, FactHit{Content: r.Content, Category: r.Metadata["category"], ItemID: r.Metadata["itemId"], Similarity: r.Similarity})
+	}
+	return out, nil
+}
+
+// QueryCoreFacts returns up to k core-fact hits scoped to libraryID.
+// Same fetchK*3 + scopeByWorkspace pattern as QueryFacts.
+func (v *VectorStore) QueryCoreFacts(emb []float32, k int, libraryID string) ([]FactHit, error) {
+	fetchK := k * 3
+	res, err := v.QueryWithEmbedding(emb, fetchK, map[string]string{"kind": "core_fact"})
+	if err != nil {
+		return nil, err
+	}
+	res = scopeByWorkspace(res, libraryID)
+	if len(res) > k {
+		res = res[:k]
+	}
+	out := make([]FactHit, 0, len(res))
+	for _, r := range res {
+		out = append(out, FactHit{Content: r.Content, Category: r.Metadata["category"], ItemID: r.Metadata["itemId"], Similarity: r.Similarity})
+	}
+	return out, nil
+}
+
+// QueryExperience returns up to k experience/insight hits scoped to libraryID.
+func (v *VectorStore) QueryExperience(emb []float32, k int, libraryID string) ([]FactHit, error) {
+	fetchK := k * 3
+	res, err := v.QueryWithEmbedding(emb, fetchK, map[string]string{"kind": "experience"})
+	if err != nil {
+		return nil, err
+	}
+	res = scopeByWorkspace(res, libraryID)
+	if len(res) > k {
+		res = res[:k]
+	}
+	out := make([]FactHit, 0, len(res))
+	for _, r := range res {
+		out = append(out, FactHit{Content: r.Content, Category: r.Metadata["expKind"], ItemID: r.Metadata["itemId"], Similarity: r.Similarity})
 	}
 	return out, nil
 }

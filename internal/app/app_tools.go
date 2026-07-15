@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
+agentPlugin "everevo/internal/plugins/tools/agents"
 
 	"everevo/internal/a2a"
 	"everevo/internal/agents"
@@ -87,6 +89,7 @@ func init() {
 		"agent_list":                hAgentList,
 		"agent_create":              hAgentCreate,
 		"agent_run":                 hAgentRun,
+			"agent_run_async":           hAgentRunAsync,
 		"library_list":                  hLibraryList,
 		"agent_delegate_to_domain":      hAgentDelegateToDomain,
 		"agent_delegate_multi_domain":   hAgentDelegateMultiDomain,
@@ -105,6 +108,8 @@ func init() {
 		"web_fetch":       hWebFetch,
 
 		// ── context: lazy tool discovery ──
+			"codebase_import":    hCodebaseImport,
+			"domain_search":       hDomainSearch,
 		"tool_search": hToolSearch,
 		// ── paradigm ──
 		"paradigm_list":     hParadigmList,
@@ -815,21 +820,46 @@ func hAgentRun(a *App, p map[string]any) tools.ToolResult {
 	if agentID == "" && name == "" {
 		return tools.ErrMsg("需要指定 agentId 或 name")
 	}
+
+	// Resilient lookup: try both fields regardless of which one the LLM used.
+	// LLMs sometimes put agent names into the agentId field.
 	var agent *agents.Agent
 	var err error
 	if agentID != "" {
 		agent, err = a.agentManager.Get(agentID)
-	} else {
+		if err != nil {
+			// Fallback: maybe the LLM put a name in the agentId field.
+			agent, err = a.agentManager.FindByName(agentID)
+		}
+	}
+	if agent == nil && name != "" {
 		agent, err = a.agentManager.FindByName(name)
+		if err != nil {
+			// Fallback: maybe the LLM put an ID in the name field.
+			agent, err = a.agentManager.Get(name)
+		}
 	}
+	if err != nil || agent == nil {
+		if err == nil {
+			err = fmt.Errorf("agent 未找到")
+		}
+		log.Printf("[agent_run] lookup failed: agentId=%q name=%q err=%v", agentID, name, err)
+		return tools.ErrResult(err)
+	}
+
+	log.Printf("[agent_run] launching agent: id=%s name=%s", agent.ID, agent.Name)
+	// Claude Code pattern: coordinator forces ALL agent spawns async.
+	// Sync execution blocks the main conversation — fire-and-forget instead.
+	taskID, err := agentPlugin.RunAgentLoopAsync(agent, task, "")
 	if err != nil {
 		return tools.ErrResult(err)
 	}
-	text, err := a.runAgentLoop(a.chatCtx, agent, task)
-	if err != nil {
-		return tools.ErrResult(err)
-	}
-	return tools.OkResult(map[string]any{"agent": agent.Name, "text": text})
+	return tools.OkResult(map[string]any{
+		"status":    "async_launched",
+		"taskId":    taskID,
+		"agentName": agent.Name,
+		"hint":      "Agent " + agent.Name + " 已启动后台执行。结果将在后续自动注入对话。",
+	})
 }
 
 
@@ -1128,4 +1158,77 @@ func floatParam(p map[string]any, key string, def float64) float64 {
 		}
 	}
 	return def
+}
+
+// hAgentRunAsync launches a sub-agent as a background task (non-blocking).
+// Returns a task ID immediately; the agent result arrives in a future turn
+// via the notification queue.
+func hAgentRunAsync(a *App, p map[string]any) tools.ToolResult {
+	if a.agentManager == nil {
+		return tools.ErrMsg("agent 管理器未初始化")
+	}
+	agentID := tools.GetString(p, "agentId")
+	name := tools.GetString(p, "name")
+	task := tools.GetString(p, "task")
+	if task == "" {
+		return tools.ErrMsg("缺少必填参数: task")
+	}
+	if agentID == "" && name == "" {
+		return tools.ErrMsg("需要指定 agentId 或 name")
+	}
+	// Resilient lookup: try agentId first as ID then as name, and vice versa.
+	// LLMs sometimes put agent names into the agentId field, or IDs into name.
+	var agent *agents.Agent
+	var err error
+	if agentID != "" {
+		agent, err = a.agentManager.Get(agentID)
+		if err != nil {
+			agent, err = a.agentManager.FindByName(agentID)
+		}
+	}
+	if agent == nil && name != "" {
+		agent, err = a.agentManager.FindByName(name)
+		if err != nil {
+			agent, err = a.agentManager.Get(name)
+		}
+	}
+	if err != nil || agent == nil {
+		if err == nil {
+			err = fmt.Errorf("agent 未找到")
+		}
+		return tools.ErrResult(err)
+	}
+	taskID, err := agentPlugin.RunAgentLoopAsync(agent, task, "")
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(map[string]any{
+		"status":    "async_launched",
+		"taskId":    taskID,
+		"agentName": agent.Name,
+		"hint":      "Agent " + agent.Name + " 已启动后台执行。结果将在后续轮次自动注入。",
+	})
+}
+
+func hCodebaseImport(a *App, p map[string]any) tools.ToolResult {
+	libID := tools.GetString(p, "libraryId")
+	result, err := a.CodebaseImport(libID)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
+}
+
+func hDomainSearch(a *App, p map[string]any) tools.ToolResult {
+	query := tools.GetString(p, "query")
+	libID := tools.GetString(p, "libraryId")
+	if query == "" || libID == "" {
+		return tools.ErrMsg("缺少必填参数: query 和 libraryId")
+	}
+	minSim := float64(tools.GetInt(p, "minSimilarity")) / 100.0
+	result, err := a.DomainSearch(query, libID, minSim)
+	if err != nil {
+		return tools.ErrResult(err)
+	}
+	return tools.OkResult(result)
 }
