@@ -1,44 +1,65 @@
-# Go
+# ── Go ──
 *.exe
 *.exe~
-build/bin/
-build/windows/
-
-# Frontend
-frontend/dist/
-frontend/node_modules/
-frontend/wailsjs/
-
-# Runtime data (logs, downloaded models, etc.)
-data/
-
-# Binary dependencies
 *.dll
-third_party/
+*.so
+*.syso
+*.test
 
-# Build artifacts
-frontend/package.json.md5
+# ── Build output ──
+dist/bin/
+dist/windows/
 
-# IDE
+# ── Frontend ──
+src/frontend/dist/
+src/frontend/node_modules/
+src/frontend/wailsjs/
+src/frontend/package.json.md5
+
+# ── Runtime data — auto-created, never commit ──
+data/models/
+data/downloads/
+data/cache/
+data/plugins/
+data/guides/
+data/envs/
+data/sessions/
+data/sandbox/
+
+# ── Zone runtime state (databases, vector indexes, manifests) ──
+data/zones/*/memory/
+data/zones/*/knowledge/chromem/
+data/zones/*/wiki/
+data/zones/*/.manifest.json
+data/zones/*/config.json
+
+# ── Conda / Python junk ──
+**/.conda/
+**/.condarc
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# ── IDE ──
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# Claude Code
+# ── Claude Code ──
 .claude/
 
-# OS
+# ── OS junk ──
 .DS_Store
 Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
 
-# Logs
+# ── Logs ──
 *.log
 
-# Backups
+# ── Misc ──
 *.bak
-*.syso
-runtime/*
+third_party/
 workspace/*
-build/*
 sample-project/*
